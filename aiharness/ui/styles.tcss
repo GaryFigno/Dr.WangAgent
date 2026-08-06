@@ -1,0 +1,341 @@
+/* Dr.Wang Agent terminal styling.
+
+   The palette is deliberately narrow: one accent for the agent, one for the
+   user, one warning and one error. Everything else is greyscale, so tool
+   activity recedes and the conversation stays legible.
+*/
+
+Screen {
+    layers: base overlay;
+    background: $surface;
+}
+
+#body {
+    height: 1fr;
+}
+
+/* -- sidebar ----------------------------------------------------------- */
+
+#sidebar {
+    width: 34;
+    background: $panel;
+    border-right: solid $primary-darken-2;
+    padding: 1 1;
+    display: none;
+}
+
+#sidebar.visible {
+    display: block;
+}
+
+#sidebar .section-title {
+    color: $text-muted;
+    text-style: bold;
+    padding: 1 0 0 0;
+}
+
+#sidebar ListView {
+    height: auto;
+    max-height: 20;
+    background: transparent;
+}
+
+/* -- transcript -------------------------------------------------------- */
+
+#transcript {
+    height: 1fr;
+    padding: 0 2;
+    scrollbar-size-vertical: 1;
+}
+
+.entry {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.user-message {
+    height: auto;
+    color: $text;
+    background: $boost;
+    border-left: thick $success;
+    padding: 0 1;
+    margin: 1 0;
+}
+
+.assistant-message {
+    height: auto;
+    padding: 0 1;
+}
+
+.reasoning {
+    height: auto;
+    color: $text-disabled;
+    text-style: italic;
+    padding: 0 1;
+    border-left: dashed $primary-darken-3;
+    margin: 0 0 1 0;
+}
+
+.notice {
+    height: auto;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+.notice.warn {
+    color: $warning;
+}
+
+.notice.error {
+    color: $error;
+}
+
+/* -- tool calls -------------------------------------------------------- */
+
+.tool-call {
+    height: auto;
+    padding: 0 1;
+    color: $text-muted;
+    border-left: solid $primary-darken-3;
+    margin: 0 0 1 0;
+}
+
+.tool-call.running {
+    border-left: solid $warning;
+}
+
+.tool-call.failed {
+    border-left: solid $error;
+    color: $error;
+}
+
+.tool-call.done {
+    border-left: solid $primary-darken-2;
+}
+
+.tool-detail {
+    height: auto;
+    color: $text-disabled;
+    padding: 0 0 0 2;
+    display: none;
+}
+
+.tool-detail.expanded {
+    display: block;
+}
+
+/* -- compaction marker -------------------------------------------------
+
+   Deliberately loud. The user must be able to scroll back and see exactly
+   where the agent's memory was condensed.
+*/
+
+.compaction {
+    height: auto;
+    margin: 1 0;
+    padding: 0 1;
+    border: round $warning 50%;
+    background: $boost;
+}
+
+.compaction-headline {
+    height: auto;
+    text-align: center;
+}
+
+.compaction-detail {
+    height: auto;
+    color: $text-muted;
+    padding: 1 1 0 1;
+    max-height: 4;
+    overflow: hidden;
+}
+
+.compaction-detail.expanded {
+    max-height: 40;
+    overflow-y: auto;
+}
+
+/* -- mascot ------------------------------------------------------------ */
+
+#pet {
+    height: auto;
+    padding: 1 0;
+    text-align: center;
+    color: $text-muted;
+}
+
+/* -- plan -------------------------------------------------------------- */
+
+#plan-panel {
+    height: auto;
+    max-height: 16;
+    background: $panel;
+    border: round $accent;
+    padding: 0 1;
+    margin: 0 2;
+    display: none;
+    overflow-y: auto;
+}
+
+#plan-panel.visible {
+    display: block;
+}
+
+QuestionModal > #dialog {
+    width: 88;
+    height: auto;
+    max-height: 34;
+    border: thick $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+QuestionModal #question-options {
+    height: auto;
+    padding: 0 0 1 0;
+}
+
+PlanModal {
+    align: center middle;
+}
+
+PlanModal > #dialog {
+    width: 96;
+    height: auto;
+    max-height: 40;
+    border: thick $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+PlanModal #plan-body {
+    height: auto;
+    max-height: 24;
+    padding: 0 0 1 0;
+}
+
+/* -- todos ------------------------------------------------------------- */
+
+#todo-panel {
+    height: auto;
+    max-height: 12;
+    background: $panel;
+    border: round $primary-darken-2;
+    padding: 0 1;
+    margin: 0 2;
+    display: none;
+}
+
+#todo-panel.visible {
+    display: block;
+}
+
+/* -- input ------------------------------------------------------------- */
+
+#input-row {
+    height: auto;
+    padding: 0 2;
+    background: $surface;
+}
+
+#prompt {
+    border: round $primary-darken-2;
+    background: $boost;
+    padding: 0 1;
+}
+
+#prompt:focus {
+    border: round $accent;
+}
+
+#completions {
+    layer: overlay;
+    width: 70;
+    height: auto;
+    max-height: 10;
+    background: $panel;
+    border: round $accent;
+    padding: 0 1;
+    display: none;
+}
+
+#completions.visible {
+    display: block;
+}
+
+/* -- status ------------------------------------------------------------ */
+
+#status {
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+    padding: 0 2;
+}
+
+#status .warn {
+    color: $warning;
+}
+
+/* -- modals ------------------------------------------------------------ */
+
+PermissionModal {
+    align: center middle;
+}
+
+PermissionModal > #dialog {
+    width: 84;
+    height: auto;
+    max-height: 30;
+    border: thick $warning;
+    background: $surface;
+    padding: 1 2;
+}
+
+PermissionModal .title {
+    text-style: bold;
+    color: $warning;
+    padding: 0 0 1 0;
+}
+
+PermissionModal .command {
+    background: $boost;
+    color: $text;
+    padding: 1;
+    margin: 0 0 1 0;
+    height: auto;
+    max-height: 12;
+}
+
+PermissionModal .reason {
+    color: $text-muted;
+    padding: 0 0 1 0;
+}
+
+ConfirmModal {
+    align: center middle;
+}
+
+ConfirmModal > #dialog {
+    width: 70;
+    height: auto;
+    border: thick $error;
+    background: $surface;
+    padding: 1 2;
+}
+
+/* -- context breakdown ------------------------------------------------- */
+
+#context-panel {
+    height: auto;
+    max-height: 20;
+    background: $panel;
+    border: round $primary-darken-2;
+    padding: 1 2;
+    margin: 0 2;
+    display: none;
+}
+
+#context-panel.visible {
+    display: block;
+}

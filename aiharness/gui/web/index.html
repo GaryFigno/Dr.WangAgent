@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dr.Wang Agent</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ── sidebar ─────────────────────────────────────────────────────── -->
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-mark" id="pet" data-i18n-title="brand.pet" title="招财"><img id="pet-img" src="/static/pet/idle.gif" alt="招财"></div>
+      <div class="brand-text">
+        <div class="brand-name">Dr.Wang Agent</div>
+        <div class="brand-sub" id="workspace-label">—</div>
+      </div>
+    </div>
+
+    <button class="primary-button" id="new-session" data-i18n="nav.newSession">＋ 新会话</button>
+
+    <div class="section-label" data-i18n="nav.projects">项目与会话</div>
+    <div id="session-list" class="scroll-area"></div>
+
+    <button class="ghost-button archive-toggle hidden" id="archive-toggle" data-i18n="nav.showArchived">显示已归档</button>
+
+    <div class="sidebar-foot">
+      <button class="ghost-button icon-foot" id="open-settings" data-i18n-title="nav.settings" title="设置">⚙</button>
+      <button class="ghost-button icon-foot" id="open-context" data-i18n-title="nav.context" title="上下文">◧</button>
+      <button class="ghost-button icon-foot" id="new-window" data-i18n-title="nav.newWindow" title="再开本机窗口">⧉</button>
+    </div>
+  </aside>
+
+  <!-- ── main column ─────────────────────────────────────────────────── -->
+  <main id="main">
+    <div id="onboarding" class="onboarding hidden"></div>
+    <header id="topbar">
+      <div class="topbar-left">
+        <span id="plan-badge" class="badge badge-plan hidden"
+              data-i18n-title="badge.planTitle"
+              title="Plan 模式：写入已锁定。点击退出">PLAN</span>
+        <span id="explore-badge" class="badge badge-explore hidden"
+              data-i18n-title="badge.exploreTitle"
+              title="Explore 模式：只读调查。点击退出">EXPLORE</span>
+        <span id="heartbeat-badge" class="badge badge-beat hidden" data-i18n="badge.heartbeat">♥ 心跳</span>
+      </div>
+      <div class="topbar-right">
+        <div class="meter" id="context-meter" data-i18n-title="meter.context" title="上下文占用">
+          <div class="meter-fill" id="context-fill"></div>
+          <span class="meter-text" id="context-text">—</span>
+        </div>
+        <span class="stat" id="cache-stat" data-i18n-title="stat.cache" title="本次运行 / 本会话 提示缓存命中率">cache —</span>
+      </div>
+    </header>
+
+    <section id="transcript" class="scroll-area"></section>
+    <div id="activity-dock" class="activity-dock hidden" aria-live="polite"></div>
+    <div id="prompt-queue" class="prompt-queue hidden"></div>
+
+    <div id="quest-strip" class="quest-strip hidden"></div>
+    <div id="todo-strip" class="hidden"></div>
+    <div id="edit-review" class="edit-review hidden" data-i18n-title="edit.reviewTitle" title="待审改动：接受或回滚"></div>
+    <div id="resource-strip" class="resource-strip hidden" data-i18n-title="resource.strip" title="本会话触及的文件与图片"></div>
+
+    <footer id="composer">
+      <div id="workspace-chips" class="chips hidden"></div>
+      <div id="goal-banner" class="goal-banner hidden">
+        <span class="goal-mark">♥</span>
+        <span class="goal-text" data-i18n="goal.banner">目标模式 —— 下面输入的内容会成为自动迭代的目标</span>
+        <span class="goal-limits" id="goal-limits"></span>
+        <button class="ghost-button goal-cancel" id="goal-cancel" data-i18n="goal.cancel">取消</button>
+      </div>
+      <div id="ref-chips" class="ref-chips hidden"></div>
+      <div id="at-menu" class="at-menu hidden"></div>
+      <div class="composer-shell">
+        <div class="composer-main">
+          <div id="attach-strip" class="attach-strip hidden"></div>
+          <textarea id="prompt" rows="4"
+                    data-i18n-placeholder="composer.placeholder"
+                    placeholder="说点什么…  （@ 引用文件 · Ctrl+Enter 发送 · Enter 换行 · 可粘贴/拖入图片）"></textarea>
+          <div class="composer-toolbar">
+            <select id="model-select" data-i18n-title="composer.model" title="本会话对话模型"></select>
+            <span id="vision-badge" class="vision-badge hidden" title=""></span>
+            <select id="effort-select" data-i18n-title="composer.effort" title="推理强度"></select>
+            <select id="context-select" data-i18n-title="composer.context" title="上下文窗口大小"></select>
+            <select id="mode-select" data-i18n-title="composer.mode" title="权限模式">
+              <option value="ask">ask · 每次确认</option>
+              <option value="auto">auto · 自动</option>
+              <option value="yolo">yolo · 不问</option>
+            </select>
+          </div>
+        </div>
+        <div class="composer-actions">
+          <button class="ghost-button" id="screenshot-button" data-i18n-title="composer.screenshot" title="截屏并附到输入框">⊡</button>
+          <button class="ghost-button" id="heartbeat-button" data-i18n-title="composer.heartbeat" title="自动迭代">♥</button>
+          <button class="ghost-button" id="interrupt" data-i18n-title="composer.interrupt" title="打断" disabled>■</button>
+          <button class="primary-button" id="send" data-i18n="composer.send">发送</button>
+        </div>
+      </div>
+    </footer>
+  </main>
+
+  <!-- ── right panel ─────────────────────────────────────────────────── -->
+  <aside id="panel" class="hidden">
+    <div class="panel-head">
+        <div class="tabs">
+        <button class="tab active" data-tab="context" data-i18n="tab.context">上下文</button>
+        <button class="tab" data-tab="files" data-i18n="tab.files">文件</button>
+        <button class="tab" data-tab="skills" data-i18n="tab.skills">Skill</button>
+        <button class="tab" data-tab="canvas" data-i18n="tab.canvas">画布</button>
+        <button class="tab" data-tab="market" data-i18n="tab.market">行情</button>
+        <button class="tab" data-tab="settings" data-i18n="tab.settings">设置</button>
+      </div>
+      <button class="icon-button" id="close-panel">✕</button>
+    </div>
+
+    <div class="panel-body scroll-area">
+
+      <!-- context tab -->
+      <div class="tab-page" data-page="context">
+        <div class="context-headline">
+          <span id="ctx-used">—</span>
+          <span class="dim" id="ctx-pct"></span>
+        </div>
+        <div class="ctx-bar" id="ctx-bar"></div>
+        <div id="ctx-rows"></div>
+        <div id="ctx-detail"></div>
+        <div class="section-label" data-i18n="ctx.turnRefs">本轮 @ 引用</div>
+        <div id="ctx-turn-refs" class="hint" data-i18n="ctx.noRefs">本轮尚未附带 @ 路径</div>
+        <div id="ctx-auto" class="hint"></div>
+      </div>
+
+      <!-- files tab -->
+      <div class="tab-page hidden" data-page="files">
+        <p class="hint" data-i18n="files.hint">工作区文件树。点击预览；也可在输入区用 @ 引用。</p>
+        <div class="form">
+          <input id="file-search" data-i18n-placeholder="files.searchPh" placeholder="搜索文件内容…">
+          <select id="file-ext-filter" title="ext">
+            <option value="">*</option>
+            <option value=".py">.py</option>
+            <option value=".js">.js</option>
+            <option value=".ts">.ts</option>
+            <option value=".md">.md</option>
+            <option value=".json">.json</option>
+          </select>
+          <button class="ghost-button" id="file-search-btn" data-i18n="files.search">搜索</button>
+        </div>
+        <div id="file-search-hits" class="hint"></div>
+        <div id="file-tree-path" class="hint">/</div>
+        <div id="file-tree" class="file-tree"></div>
+        <div class="section-label" data-i18n="files.preview">预览</div>
+        <pre id="file-preview" class="file-preview hint" data-i18n="files.pick">选择一个文件</pre>
+        <div class="panel-actions">
+          <button class="ghost-button" id="file-open-external" data-i18n="files.openExt">在资源管理器中打开</button>
+        </div>
+        <div class="section-label" data-i18n="files.diff">待审 Diff</div>
+        <div id="edit-diff-panel" class="hint" data-i18n="edit.none">暂无待审改动</div>
+      </div>
+
+      <!-- skills tab -->
+      <div class="tab-page hidden" data-page="skills">
+        <p class="hint" data-i18n="skills.hint">
+          Skill 是一份 SKILL.md 说明书。系统提示里只放名字和描述，
+          正文等 agent 用到时才加载 —— 装一百个也几乎不占上下文。
+        </p>
+
+        <div class="section-label" data-i18n="skills.installed">已安装</div>
+        <div id="skill-list"></div>
+
+        <div class="section-label" data-i18n="skills.roots">自动搜索的目录</div>
+        <div id="skill-roots" class="hint"></div>
+
+        <div class="section-label" data-i18n="skills.extra">额外目录</div>
+        <div id="skill-paths"></div>
+        <div class="form">
+          <input id="skill-path-input" data-i18n-placeholder="skills.pathPh" placeholder="例如 C:\ClaudeProjects\skills">
+          <div class="panel-actions">
+            <button class="ghost-button" id="browse-skill-path" data-i18n="skills.browse">浏览…</button>
+            <button class="ghost-button" id="add-skill-path" data-i18n="skills.add">添加</button>
+            <button class="ghost-button" id="reload-skills" data-i18n="skills.reload">重新扫描</button>
+          </div>
+        </div>
+        <div id="skill-errors" class="hint"></div>
+
+        <div class="section-label" data-i18n="skills.learn">工作流学习</div>
+        <p class="hint" data-i18n="skills.learnHint">扫描近期会话，找出可沉淀为 Skill 的重复习惯（不会自动写入）。</p>
+        <div class="panel-actions">
+          <button class="ghost-button" id="learn-skills" data-i18n="skills.scan">扫描候选 Skill</button>
+        </div>
+        <div id="learn-results" class="hint"></div>
+      </div>
+
+      <!-- canvas tab -->
+      <div class="tab-page hidden" data-page="canvas">
+        <p class="hint" data-i18n="canvas.hint">
+          预览并编辑工作区内的 Markdown / HTML / 文本产物；图片只读。
+          HTML 可边改源码边刷新预览。
+        </p>
+        <div class="form">
+          <input id="canvas-path" data-i18n-placeholder="canvas.pathPh" placeholder="例如 docs/design.md 或 .aiharness/screenshots/page.png">
+          <div class="panel-actions">
+            <button class="ghost-button" id="canvas-open" data-i18n="canvas.open">打开</button>
+            <button class="ghost-button" id="canvas-save" data-i18n="canvas.save" disabled>保存</button>
+            <button class="ghost-button" id="canvas-reveal" data-i18n="canvas.reveal">在资源管理器中显示</button>
+          </div>
+        </div>
+        <div id="canvas-view" class="canvas-view"></div>
+      </div>
+
+      <!-- market tab -->
+      <div class="tab-page hidden" data-page="market">
+        <p class="hint" data-i18n="market.hint">
+          行情分析 / 提醒 / 回测 / 纸上交易入口。硬约束：不做真实下单。
+        </p>
+        <div class="form">
+          <input id="market-symbol" data-i18n-placeholder="market.symbolPh" placeholder="代码，如 600519.SH 或 AAPL">
+          <div class="panel-actions">
+            <button class="ghost-button" id="market-quote" data-i18n="market.quote">查询报价</button>
+            <button class="ghost-button" id="market-history" data-i18n="market.history">近 30 日 K 线</button>
+            <button class="ghost-button" id="market-backtest" data-i18n="market.backtest">MA 回测</button>
+            <button class="ghost-button" id="paper-status" data-i18n="market.paper">纸上账户</button>
+          </div>
+          <div class="panel-actions">
+            <input id="market-alert-price" placeholder="提醒价" style="max-width:7rem">
+            <select id="market-alert-op">
+              <option value=">=">≥</option>
+              <option value="<=">≤</option>
+              <option value=">">></option>
+              <option value="<"><</option>
+            </select>
+            <button class="ghost-button" id="market-alert-add" data-i18n="market.alertAdd">加提醒</button>
+            <button class="ghost-button" id="market-alert-list" data-i18n="market.alertList">提醒列表</button>
+          </div>
+        </div>
+        <div id="market-chart" class="market-chart"></div>
+        <pre id="market-out" class="market-out hint" data-i18n="market.none">尚未查询</pre>
+      </div>
+
+      <!-- settings tab -->
+      <div class="tab-page hidden" data-page="settings">
+        <div id="setup-warning" class="warning hidden"></div>
+        <div class="warning" id="security-note" data-i18n="settings.security">
+          安全提醒：API Key 只应粘贴到账号表单（写入凭据库）。若曾把密钥发进对话或截图，请立刻轮换。
+          GUI 仅监听本机 loopback 并校验 token。
+        </div>
+
+        <div class="section-label" data-i18n="settings.language">界面语言</div>
+        <div class="form">
+          <select id="language-select" title="Interface language"></select>
+        </div>
+        <p class="hint" data-i18n="settings.languageHint">
+          立即生效，并记住你的选择。Auto 跟随系统/浏览器语言。
+        </p>
+
+        <div class="section-label" data-i18n="settings.accounts">API 账号</div>
+        <div id="account-list"></div>
+        <form id="account-form" class="form">
+          <input id="acc-id" data-i18n-placeholder="settings.accId" placeholder="账号名，如 ds" autocomplete="off">
+          <input id="acc-url" placeholder="https://api.deepseek.com/v1" autocomplete="off">
+          <input id="acc-env" data-i18n-placeholder="settings.accKey" placeholder="粘贴 API Key，或填环境变量名" autocomplete="off">
+          <label class="field-label" for="acc-proxy" data-i18n="settings.proxy">网络出口</label>
+          <input id="acc-proxy" list="proxy-presets"
+                 data-i18n-placeholder="settings.proxyPh"
+                 placeholder="留空＝跟随系统；直连；或 http://127.0.0.1:7897"
+                 autocomplete="off">
+          <datalist id="proxy-presets"></datalist>
+          <button class="primary-button" type="submit" data-i18n="settings.addVerify">添加并验证</button>
+          <div id="account-result" class="form-result hidden"></div>
+          <p class="hint" data-i18n="settings.accHint1">
+            两种都行：直接粘贴 sk-… 密钥，或者填环境变量名。粘贴的密钥存到单独的凭据文件里，不会写进 config.yaml。
+          </p>
+          <p class="hint" data-i18n="settings.accHint2">
+            网络出口按账号单独生效：国外模型填代理；国内模型可填直连。留空则跟随系统代理。
+          </p>
+        </form>
+
+        <div class="section-label" data-i18n="settings.caps">需要授权的能力</div>
+        <p class="hint" data-i18n="settings.capsHint">
+          这两项默认关闭。它们是唯一会伸到工作目录之外的工具，关掉后模型看不到它们。
+        </p>
+        <div id="capability-list"></div>
+
+        <div class="section-label" data-i18n="settings.routing">任务分流</div>
+        <label class="check-row" for="auto-classify">
+          <input type="checkbox" id="auto-classify">
+          <span data-i18n="settings.autoClassify">自动识别大项目并进入 Plan 模式（需绑定 cheap / fast 角色）</span>
+        </label>
+        <p class="hint" data-i18n="settings.autoClassifyHint">
+          打开时先用便宜模型打分；关掉则不自动进 Plan。顶栏 PLAN 可随时退出。
+        </p>
+
+        <div class="section-label" data-i18n="settings.review">编辑审阅</div>
+        <label class="check-row" for="auto-apply-edits">
+          <input type="checkbox" id="auto-apply-edits">
+          <span data-i18n="settings.autoApply">yolo 模式下自动接受 Write/Edit（跳过待审条）</span>
+        </label>
+        <p class="hint" data-i18n="settings.autoApplyHint">
+          仅在 yolo 时生效。ask/auto 仍会弹出待审改动。
+        </p>
+
+        <div class="section-label" data-i18n="settings.rules">Rules</div>
+        <p class="hint" data-i18n="settings.rulesHint">全局与项目规则（写入后下一轮立刻生效）。</p>
+        <div id="rules-editor-list"></div>
+        <div class="form">
+          <select id="rule-scope">
+            <option value="project" data-i18n="settings.scopeProject">项目</option>
+            <option value="global" data-i18n="settings.scopeGlobal">全局</option>
+          </select>
+          <input id="rule-name" data-i18n-placeholder="settings.ruleName" placeholder="文件名，如 coding.md">
+          <textarea id="rule-body" rows="4" data-i18n-placeholder="settings.ruleBody" placeholder="规则正文"></textarea>
+          <button class="ghost-button" id="save-rule" data-i18n="settings.saveRule">保存规则</button>
+        </div>
+
+        <div class="section-label" data-i18n="settings.memories">Memories</div>
+        <p class="hint" data-i18n="settings.memoriesHint">钉住给 agent 的短期事实（存于 .aiharness/memories.json）。</p>
+        <div id="memory-list"></div>
+        <div class="form">
+          <input id="memory-input" data-i18n-placeholder="settings.memoryPh" placeholder="例如：本仓库默认用 pytest">
+          <button class="ghost-button" id="add-memory" data-i18n="settings.addMemory">添加记忆</button>
+        </div>
+
+        <div class="section-label" data-i18n="settings.quest">Quest</div>
+        <p class="hint" data-i18n="settings.questHint">带步骤的长任务；失败可续跑，不整段重来。</p>
+        <div id="quest-settings" class="hint" data-i18n="settings.questIdle">尚未开始</div>
+        <div class="form">
+          <input id="quest-goal" data-i18n-placeholder="settings.questGoal" placeholder="目标">
+          <input id="quest-steps" data-i18n-placeholder="settings.questSteps" placeholder="步骤，用 | 分隔">
+          <div class="panel-actions">
+            <button class="ghost-button" id="start-quest" data-i18n="settings.startQuest">开始 Quest</button>
+            <button class="ghost-button" id="resume-quest" data-i18n="settings.resumeQuest">从断点续</button>
+            <button class="ghost-button" id="clear-quest" data-i18n="settings.clearQuest">清除</button>
+          </div>
+        </div>
+
+        <div class="section-label" data-i18n="settings.models">模型</div>
+        <div id="model-list"></div>
+        <div class="form">
+          <select id="catalogue-account"></select>
+          <button class="ghost-button" id="fetch-models" data-i18n="settings.fetchModels">拉取该账号的模型列表</button>
+          <div id="catalogue" class="catalogue hidden"></div>
+        </div>
+
+        <div class="section-label" data-i18n="settings.roles">角色分工</div>
+        <p class="hint" data-i18n="settings.rolesHint">
+          默认对话模型只决定新会话起点；当前对话以输入区旁的选型为准。
+        </p>
+        <div id="role-list"></div>
+
+        <div class="section-label" data-i18n="settings.about">关于与支持</div>
+        <p class="hint" id="about-version"></p>
+        <p class="hint" data-i18n="settings.supportHint">
+          开源项目靠自愿赞助维持。可走 GitHub Sponsors，或用支付宝扫码。
+        </p>
+        <div class="panel-actions">
+          <button class="ghost-button" id="open-support" data-i18n="settings.supportAuthor">支持作者</button>
+        </div>
+
+        <div class="panel-actions">
+          <button class="primary-button" id="save-config" data-i18n="settings.saveConfig">保存到配置文件</button>
+        </div>
+      </div>
+
+    </div>
+  </aside>
+</div>
+
+<!-- ── modals ────────────────────────────────────────────────────────── -->
+<div id="modal-backdrop" class="hidden">
+  <div id="modal">
+    <div id="modal-title" class="modal-title"></div>
+    <div id="modal-body" class="modal-body"></div>
+    <div id="modal-actions" class="modal-actions"></div>
+  </div>
+</div>
+
+<!-- Image preview / annotate before send -->
+<div id="image-editor" class="image-editor hidden" aria-modal="true" role="dialog">
+  <div class="image-editor-panel">
+    <div class="image-editor-toolbar">
+      <div class="image-editor-tools">
+        <button type="button" class="img-tool active" data-tool="pan" title="查看">✋</button>
+        <button type="button" class="img-tool" data-tool="rect" title="矩形">▭</button>
+        <button type="button" class="img-tool" data-tool="ellipse" title="圆/椭圆">○</button>
+        <button type="button" class="img-tool" data-tool="pen" title="画笔">✎</button>
+        <button type="button" class="img-tool" data-tool="text" title="文字">T</button>
+      </div>
+      <div class="image-editor-colors" id="image-editor-colors"></div>
+      <label class="image-editor-size" title="文字大小">
+        <span>字号</span>
+        <select id="image-editor-font-size">
+          <option value="sm">小</option>
+          <option value="md" selected>中</option>
+          <option value="lg">大</option>
+          <option value="xl">特大</option>
+        </select>
+      </label>
+      <div class="image-editor-actions">
+        <button type="button" id="img-undo" title="撤销">↩</button>
+        <button type="button" id="img-copy">复制</button>
+        <button type="button" id="img-apply" class="primary-button">应用到附件</button>
+        <button type="button" id="img-close">关闭</button>
+      </div>
+    </div>
+    <div class="image-editor-canvas-wrap">
+      <canvas id="image-editor-canvas"></canvas>
+      <textarea id="image-editor-text" class="image-editor-text hidden" rows="2"
+                placeholder="输入文字，Enter 确认 · Shift+Enter 换行 · Esc 取消"></textarea>
+    </div>
+  </div>
+</div>
+
+<div id="toast-stack"></div>
+
+<script src="/static/i18n.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

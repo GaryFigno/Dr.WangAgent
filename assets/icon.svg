@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"
+     role="img" aria-label="Dr.Wang Agent — 招财">
+  <title>Dr.Wang Agent</title>
+  <desc>A round tabby cat in a terracotta scarf, sitting inside a terminal window.</desc>
+
+  <!--
+    Canonical vector source for the app icon. assets/build_icons.py draws the
+    same geometry with Pillow to produce the PNG and ICO assets, so the two
+    must be changed together. Coordinates are in this 256x256 space.
+  -->
+
+  <defs>
+    <linearGradient id="fur" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#e8d9c3"/>
+      <stop offset="100%" stop-color="#cdb491"/>
+    </linearGradient>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#241f1c"/>
+      <stop offset="100%" stop-color="#14110f"/>
+    </linearGradient>
+    <clipPath id="body-clip">
+      <ellipse cx="128" cy="152" rx="78" ry="72"/>
+    </clipPath>
+  </defs>
+
+  <!-- app-icon plate -->
+  <rect width="256" height="256" rx="58" fill="url(#plate)"/>
+  <rect x="3" y="3" width="250" height="250" rx="55" fill="none"
+        stroke="#c96f4a" stroke-opacity="0.35" stroke-width="2"/>
+
+  <!-- terminal chrome, so the mark reads as a CLI rather than a sticker -->
+  <g fill="#c96f4a" fill-opacity="0.55">
+    <circle cx="30" cy="28" r="5"/>
+    <circle cx="48" cy="28" r="5"/>
+    <circle cx="66" cy="28" r="5"/>
+  </g>
+
+  <!-- ears -->
+  <g fill="#a8896a">
+    <path d="M64 104 L74 46 L112 78 Z"/>
+    <path d="M192 104 L182 46 L144 78 Z"/>
+  </g>
+  <g fill="#c98f86">
+    <path d="M76 96 L82 62 L104 80 Z"/>
+    <path d="M180 96 L174 62 L152 80 Z"/>
+  </g>
+
+  <!-- body -->
+  <ellipse cx="128" cy="152" rx="78" ry="72" fill="url(#fur)"/>
+
+  <!-- tabby stripes: three bands per flank, mirrored -->
+  <g clip-path="url(#body-clip)" stroke="#a8896a" stroke-width="10"
+     stroke-linecap="round" fill="none" opacity="0.88">
+    <path d="M40.41 112.48 A 40 22 0 0 1 98 100.95"/>
+    <path d="M40.41 144.48 A 40 22 0 0 1 98 132.95"/>
+    <path d="M40.41 176.48 A 40 22 0 0 1 98 164.95"/>
+    <path d="M158 100.95 A 40 22 0 0 1 215.59 112.48"/>
+    <path d="M158 132.95 A 40 22 0 0 1 215.59 144.48"/>
+    <path d="M158 164.95 A 40 22 0 0 1 215.59 176.48"/>
+  </g>
+
+  <!-- whiskers, behind the face so the muzzle stays clean -->
+  <g stroke="#2c2521" stroke-width="4" stroke-linecap="round" opacity="0.6">
+    <path d="M60 146 L96 152"/>
+    <path d="M60 168 L96 160"/>
+    <path d="M196 146 L160 152"/>
+    <path d="M196 168 L160 160"/>
+  </g>
+
+  <!-- face: a contented squint, drawn wide so it survives a 16px render -->
+  <g stroke="#2c2521" stroke-width="8" stroke-linecap="round" fill="none">
+    <path d="M86.23 129.57 A 15 14 0 0 1 115.77 129.57"/>
+    <path d="M140.23 129.57 A 15 14 0 0 1 169.77 129.57"/>
+  </g>
+  <path d="M118 152 L138 152 L128 164 Z" fill="#b05a38"/>
+  <g stroke="#2c2521" stroke-width="5" stroke-linecap="round" fill="none">
+    <path d="M128 167 A 9 9 0 0 1 110 167"/>
+    <path d="M146 167 A 9 9 0 0 1 128 167"/>
+  </g>
+
+  <!-- the scarf: the signature shape, and the app's accent colour -->
+  <path d="M62 182 L95 198 L128 203 L161 198 L194 182
+           L190 204 L156 220 L100 220 L66 204 Z" fill="#c96f4a"/>
+  <path d="M168 206 L196 214 L206 246 L178 250 L172 224 Z" fill="#b05a38"/>
+
+  <!-- paws -->
+  <g fill="#e8d9c3" stroke="#a8896a" stroke-width="3">
+    <ellipse cx="98" cy="229" rx="17" ry="11"/>
+    <ellipse cx="140" cy="229" rx="17" ry="11"/>
+  </g>
+</svg>

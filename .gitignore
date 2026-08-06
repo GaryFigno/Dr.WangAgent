@@ -1,0 +1,83 @@
+# --- Python / tooling ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.log
+
+# --- Secrets & local API settings (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+**/credentials.json
+**/secrets.yaml
+**/secrets.yml
+**/secrets.json
+**/api_keys.json
+**/api-keys.json
+**/*_api_key*
+**/*api-key*
+
+# User / project harness config that may embed accounts or proxies
+.aiharness.yaml
+.aiharness.yml
+config.yaml
+config.local.yaml
+**/config.local.yaml
+
+# Runtime project state (sessions, memories, screenshots, …)
+.aiharness/
+.claude/
+
+# --- Skills that may carry API keys or private tooling ---
+# Put any skill that embeds keys, tokens, or vendor secrets here.
+skills.private/
+.private-skills/
+**/skills.private/
+**/skills/**/.env
+**/skills/**/.env.*
+**/skills/**/secrets/
+**/skills/**/credentials*
+**/skills/**/*api*key*
+**/SKILL.md.local
+
+# Named API-dependent skills (if copied into this repo from ClaudeProjects/skills)
+skills/openai-image-api-i2i/
+skills/tripo3d-pipeline/
+skills/hunyuan3d-pipeline/
+skills/image2-queue/
+skills/dreamina-i2v-workflow/
+skills/ai-visual-generation-workflow/
+skills/.system/
+**/openai-image-api-i2i/
+**/tripo3d-pipeline/
+**/hunyuan3d-pipeline/
+
+# Optional: local-only donate assets you do not want public
+aiharness/gui/web/donate/*.local.*
+assets/donate/*.local.*
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- Packaging leftovers ---
+*.spec.bak
+packaging/Output/
