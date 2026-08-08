@@ -4,13 +4,19 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/Platform-Windows-important.svg)]()
-[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4%EF%B8%8F%20Dr.Wang%20Agent-ff69b4.svg)](https://github.com/sponsors/YOUR_GITHUB_USERNAME)
+[![License](https://img.shields.io/badge/License-PolyForm_Noncommercial_1.0.0-important.svg)](LICENSE)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4%EF%B8%8F%20Dr.Wang%20Agent-ff69b4.svg)](https://github.com/sponsors/GaryFigno)
 
-本地桌面编码 Agent（内部包名 / 命令仍为 `aiharness` / `aih`）。跑在**任意 OpenAI 兼容 API** 上。
+[English](README.en.md) · 简体中文
+
+本地桌面编码 Agent（内部包名 / 命令仍为 `aiharness` / `aih`）。跑在**任意
+OpenAI 兼容 API** 上，并且自带 **Codex CLI 与 Claude Code CLI 的可视化面板**
+—— 一个窗口同时管三套 Agent。
 
 核心区别：**模型**和**API 账号**是两回事。同一个模型可以挂多个账号（同一个 URL
 不同 key，或者不同网关），你可以在选模型时直接指定用哪个账号，也可以让路由器
-自动挑选并在失败时切换。
+自动挑选并在失败时切换。Codex / Claude 面板同样可以直接换 API 接入：界面里选
+供应商模板、填 `base_url` 和 key，自动生成 CLI 配置，密钥只进系统凭据库。
 
 ```
 /model ds-reasoner@deepseek-b     # 指定模型 + 指定账号
@@ -36,11 +42,51 @@ Chinese-first. Free desktop app — sponsorship keeps it going.*
 - **MCP 生态** —— 直接接入现成 MCP 服务器，工具占用按 server 细分
 - **Skill 系统** —— 内置 Skill 装载；工作流学习把重复套路自动沉淀成 skill
 - **定时任务 + 心跳自迭代** —— 轮数 / 花费 / 时长 / 失败次数四道硬上限
+- **Codex / Claude 可视化面板** —— 原生 Codex CLI、Claude Code CLI 直接装进窗口：
+  多会话隔离、审批浮窗、图片输入、自动回收孤儿进程，CLI 的体验补齐成桌面 GUI
+- **免改配置换 API** —— Codex / Claude 面板内选供应商模板（Kimi、智谱 GLM、Gemini、
+  Grok、OpenAI、Anthropic…），填 `base_url` + key 即生成 CLI 配置；协议不兼容时自动
+  做 Responses ↔ Chat 转换，密钥只进系统凭据库
 - **双界面** —— 桌面窗口（WebView2）+ 终端 TUI，同一后端
 - **隐私优先** —— 只绑 `127.0.0.1` + 一次性 token；密钥走系统凭据库，不入配置文件
 - **吉祥物桌宠** —— 招财猫动画跟随 agent 状态（思考 / 干活 / 搞定 / 出错 / 整理记忆）
 
 ---
+## 三个工作区：Agent / Codex / Claude
+
+窗口顶部可以切换三种面板，共用同一个后端与权限模型，但会话、工作区、进程
+完全隔离，不会互相串扰：
+
+| 面板 | 运行的是什么 | 典型用途 |
+|---|---|---|
+| **Agent** | 本项目自研的 agent 循环（`providers/` 路由 + `agent/` 主循环） | 多账号路由、多 Agent 工作流、Plan 模式、压缩、定时任务 |
+| **Codex** | 原生 [Codex CLI](https://github.com/openai/codex)（app-server 协议） | 用 Codex 干活，但保留窗口、多会话和审批界面 |
+| **Claude** | 原生 Claude Code CLI（`claude` 二进制） | 用 Claude Code 干活，支持订阅登录或第三方 API key |
+
+### Codex 面板
+
+- **多供应商模板**：Kimi（Moonshot）、智谱 GLM、Gemini、xAI Grok、OpenAI，
+  每个模板自带 `base_url` 与已知模型表；也可以手填任意 OpenAI 兼容地址
+- **换 API 零配置**：在界面上选模板 / 填 `base_url` + key，自动生成 Codex
+  `config.toml`；key 存系统凭据库，模板里只写 `${ENV}` 引用，不落盘
+- **协议自动转换**：Codex 走 Responses API，而 Kimi 等国内模型只有 chat
+  接口 —— 内置转换层在中间做映射（`aiharness/gui/responses_bridge.py`），界面无感
+- **一键导入**：把 Agent 面板里配好的账号直接导入 Codex profile，模型名、密钥、
+  地址一次带齐；`/models` 拉不到时回退到内置模型表
+- **多会话隔离**：每个会话独立进程 + 独立 `thread_id`，可并发；会话状态持久化，
+  孤儿进程启动时自动回收
+
+### Claude 面板
+
+- **两种接入方式**：Anthropic 订阅登录（走 `claude auth login`），或第三方
+  API key（Kimi Coding 等走 Anthropic 兼容协议）—— 后者在界面里填 key 即可
+- **薄宿主设计**：不自己实现 agent 循环，只做转发（文本 + 图片）、把审批 /
+  问题浮到 UI、隔离会话，保证行为和原版 CLI 一致
+- **自动修复**：失效的 profile（供应商改地址 / 改模型名）会按已知模板自动修复，
+  不用手工翻配置文件
+
+---
+
 ## 安装
 
 **下载版**（不需要装 Python）：解压 `Dr.Wang-x.y.z-windows.zip`，双击
@@ -114,7 +160,7 @@ python packaging/build.py --clean --installer
 
 软件免费使用，靠自愿赞助维持。喜欢它就给颗 ⭐，愿意的话请我们喝杯咖啡 ☕：
 
-[![Sponsor on GitHub](https://img.shields.io/badge/GitHub_Sponsors-%E2%9D%A4%EF%B8%8F-ff69b4?logo=github)](https://github.com/sponsors/YOUR_GITHUB_USERNAME)
+[![Sponsor on GitHub](https://img.shields.io/badge/GitHub_Sponsors-%E2%9D%A4%EF%B8%8F-ff69b4?logo=github)](https://github.com/sponsors/GaryFigno)
 
 赞助完全自愿，不解锁功能。
 
@@ -144,11 +190,25 @@ python packaging/build.py --clean --installer
 
 可裁剪边框，二维码保持清晰。重新打包或刷新 GUI 后，设置「支持作者」会显示已放入的图。
 
-收款码可以公开；**切勿**把 API Key、`.env`、私人 skill 一并提交。
+> **收款码不进公开仓库。** 两个文件已被 `.gitignore` 排除（`alipay.png` /
+> `wechat.png`），只存在于本地用于打包，避免收款码和个人信息被公开仓库永久
+> 收录（一旦推上去，fork 里永远删不掉）。**切勿**把 API Key、`.env`、私人
+> skill 一并提交。
 
 ---
 
-## 代码备份到私有仓库前（别提交密钥）
+## 许可证与商标
+
+本仓库采用 **PolyForm Noncommercial License 1.0.0**（`LICENSE`）：
+
+- ✅ 允许：个人 / 学习 / 研究 / 内部试用等**非商业**用途的查看、使用、修改、分发
+- ❌ 不允许：**商业用途**（含用本代码构建商业产品或服务）。需要商业授权请通过
+  GitHub Sponsors 或仓库 Issue 联系作者
+
+**「Dr.Wang Agent」名称与招财猫 logo 是作者的商标，不在本许可证授权范围内。**
+派生作品必须改名、换标识，不得暗示与原作者有关。
+
+## 密钥安全（提交前必读）
 
 本仓库已带 `.gitignore`，会排除：
 

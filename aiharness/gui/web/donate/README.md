@@ -1,6 +1,6 @@
 # Donate assets
 
-Place payment QR images here:
+Place payment QR images here **locally** for packaging:
 
 | File | Source |
 |---|---|
@@ -13,4 +13,8 @@ Tips:
 2. Keep filenames exactly as above (lowercase).
 3. Do **not** put API keys or other secrets in this folder.
 
-The settings panel 「支持作者」 shows whichever images are present.
+> **These two files are git-ignored and will never be published.**
+> They exist only on your machine so the packaged app can show the payment QR
+> codes in Settings → About & support → "Support the author". If you want the
+> codes public, that is your call — but remember GitHub history is forever:
+> once pushed, a fork keeps them even after deletion.

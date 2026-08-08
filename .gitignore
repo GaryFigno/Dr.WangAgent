@@ -38,8 +38,15 @@ config.local.yaml
 **/config.local.yaml
 
 # Runtime project state (sessions, memories, screenshots, …)
-.aiharness/
+# Rules under .aiharness/rules are source-controlled; everything else is not.
+.aiharness/*
+!.aiharness/rules/
 .claude/
+
+# Local scratch: live API probes, message dumps, downloaded API schemas.
+# Contains real conversations / account data — never publish.
+.cursor-tmp/
+**/.cursor-tmp/
 
 # --- Skills that may carry API keys or private tooling ---
 # Put any skill that embeds keys, tokens, or vendor secrets here.
@@ -65,7 +72,9 @@ skills/.system/
 **/tripo3d-pipeline/
 **/hunyuan3d-pipeline/
 
-# Optional: local-only donate assets you do not want public
+# Personal payment QR codes — keep local for packaging; never publish.
+aiharness/gui/web/donate/alipay.png
+aiharness/gui/web/donate/wechat.png
 aiharness/gui/web/donate/*.local.*
 assets/donate/*.local.*
 
