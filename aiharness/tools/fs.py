@@ -23,6 +23,11 @@ from ..constants import (
     PATH_SUGGEST_PREFIX_CHARS,
 )
 from ..process import hidden_subprocess_kwargs
+from ..workspace.ignore import (
+    DEFAULT_IGNORED_DIR_NAMES,
+    IgnoreMatcher,
+    IGNORED_DIRS,  # noqa: F401 — re-export for older imports
+)
 from .base import Tool, ToolContext, ToolResult
 
 #: Bytes that count as printable when sniffing for binary content.
@@ -32,11 +37,8 @@ PRINTABLE_CONTROL = (9, 10, 13)  # tab, newline, carriage return
 #: Encodings tried, in order, when reading a text file.
 TEXT_ENCODINGS = ("utf-8", "utf-8-sig", "gbk", "latin-1")
 
-IGNORED_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache",
-    ".pytest_cache", ".ruff_cache", "dist", "build", ".next", ".turbo",
-    "target", ".idea", ".gradle", ".tox", ".cache",
-}
+# Back-compat alias (set → frozenset).
+IGNORED_DIRS = DEFAULT_IGNORED_DIR_NAMES
 
 
 def _queue_review(
@@ -123,6 +125,10 @@ Always Read a file before editing it.
                 "file_path": {"type": "string", "description": "Path to the file (absolute or workspace-relative)"},
                 "offset": {"type": "integer", "description": "First line to read (1-indexed)"},
                 "limit": {"type": "integer", "description": "How many lines to read"},
+                "force": {
+                    "type": "boolean",
+                    "description": "Re-read even when the file is unchanged since the last Read",
+                },
             },
             "required": ["file_path"],
         }
@@ -144,10 +150,34 @@ Always Read a file before editing it.
             size = path.stat().st_size
             return ToolResult.error(f"{path} looks like a binary file ({size} bytes); not read.")
 
-        text = await asyncio.to_thread(_read_text, path)
-        lines = text.splitlines()
+        key = str(path.resolve())
+        try:
+            mtime = path.stat().st_mtime
+        except OSError as error:
+            return ToolResult.error(str(error))
         offset = max(int(args.get("offset") or 1), 1)
         limit = int(args.get("limit") or MAX_READ_LINES)
+        force = bool(args.get("force"))
+        # OpenCode-style: unchanged re-reads become a stub unless forced /
+        # windowed, so the main model is not fed the same file twice.
+        if (
+            not force
+            and offset == 1
+            and limit >= MAX_READ_LINES
+            and ctx.read_files.get(key) == mtime
+        ):
+            return ToolResult(
+                content=(
+                    f"[unchanged] {path} — same mtime as the last Read; "
+                    "full contents omitted. Pass force=true or a new offset "
+                    "to re-read."
+                ),
+                summary=f"cached {ctx.rel(path)}",
+                display={"kind": "read", "path": str(path), "cached": True},
+            )
+
+        text = await asyncio.to_thread(_read_text, path)
+        lines = text.splitlines()
         window = lines[offset - 1 : offset - 1 + limit]
 
         rendered = []
@@ -158,7 +188,7 @@ Always Read a file before editing it.
                 line = line[:MAX_LINE_CHARS] + f"… [{overflow} more chars]"
             rendered.append(f"{number}\t{line}")
 
-        ctx.read_files[str(path.resolve())] = path.stat().st_mtime
+        ctx.read_files[key] = mtime
 
         body = "\n".join(rendered)
         if not body:
@@ -353,11 +383,12 @@ modification time, newest first. Fast on large trees.
         scan_ceiling = limit * GLOB_SCAN_MULTIPLIER
 
         def walk() -> list[Path]:
+            matcher = IgnoreMatcher.for_workspace(ctx.workspace)
             found: list[Path] = []
             for p in root.rglob("*"):
                 if len(found) >= scan_ceiling:
                     break
-                if any(part in IGNORED_DIRS for part in p.parts):
+                if matcher.is_ignored(p):
                     continue
                 if not p.is_file():
                     continue
@@ -481,11 +512,12 @@ output_mode: "content" (matching lines), "files" (paths only), "count".
         files_with_matches: list[str] = []
         counts: dict[str, int] = {}
 
+        matcher = IgnoreMatcher.for_workspace(ctx.workspace)
         paths = [root] if root.is_file() else root.rglob("*")
         for p in paths:
             if len(results) >= limit and mode == "content":
                 break
-            if any(part in IGNORED_DIRS for part in p.parts) or not p.is_file():
+            if matcher.is_ignored(p) or not p.is_file():
                 continue
             if glob_filter and not (
                 fnmatch.fnmatch(p.name, glob_filter)

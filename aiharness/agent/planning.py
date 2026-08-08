@@ -156,7 +156,7 @@ code fence.
 
 {"score": <1-10>, "reason": "<one short sentence>", "questions": [...]}
 
-`score` is how much process the request deserves:
+`score` is how much process the **new request** deserves:
 
   1-2  A question, a one-line change, a lookup. Just do it.
   3-4  A normal task: a few files, a clear goal, no design decisions.
@@ -169,11 +169,25 @@ Judge the *work*, not the wording. "Add a button" to a codebase with no UI
 layer is not a 2. "Refactor everything" that turns out to be one file is not
 an 8.
 
+**Conversation context (critical):** When "Conversation so far" is provided,
+score the new request **in that ongoing thread**, not as a cold start.
+
+- Continuations, answers to prior questions, corrections ("不对", "改成这个",
+  "直接用…"), picking among options already discussed ("这里选哪个"), and
+  short add-ons ("还有…") are usually 1-4 — even if the overall topic is a
+  large project that already started earlier in the chat.
+- Do **not** score 8-10 merely because the chat topic is big. Score 8-10 only
+  when **this message itself** opens substantial NEW work that still needs
+  design agreement before writing.
+- When unsure between "continue current work" and "new project", prefer the
+  lower score. False plan-mode is worse than occasionally skipping ceremony.
+
 `questions` holds only the things you genuinely cannot decide yourself and
 where a wrong guess means building the wrong thing. Leave it empty for
-anything you could resolve by reading the code, and for choices with an
-obvious conventional default. Never ask about style preferences, and never
-ask more than %(max_questions)d.
+anything you could resolve by reading the code, the conversation so far, or
+choices with an obvious conventional default. Never ask about style
+preferences, and never ask more than %(max_questions)d. Do not re-ask what
+the user already answered in the conversation.
 
 Each question:
 
@@ -336,6 +350,71 @@ def parse_plan(raw: dict[str, Any], fallback_goal: str) -> Plan:
 # model calls
 # --------------------------------------------------------------------------
 
+#: Recent user/assistant turns fed to the classifier (not the full transcript).
+CLASSIFIER_CONTEXT_TURNS = 8
+#: Hard cap so the cheap classifier stays cheap.
+CLASSIFIER_CONTEXT_CHARS = 4000
+#: Per-turn trim inside the classifier context window.
+CLASSIFIER_TURN_CHARS = 480
+
+
+def _strip_classifier_noise(text: str) -> str:
+    """Drop harness appendices that should not influence scoring."""
+    cut = text.split("<clarifications>")[0].split("[Plan mode")[0]
+    return cut.strip()
+
+
+def build_classifier_context(
+    messages: list[Message] | tuple[Message, ...] | Any,
+    *,
+    max_turns: int = CLASSIFIER_CONTEXT_TURNS,
+    max_chars: int = CLASSIFIER_CONTEXT_CHARS,
+    turn_chars: int = CLASSIFIER_TURN_CHARS,
+) -> str:
+    """Compact recent transcript so complexity scoring sees the thread.
+
+    Without this, follow-ups like "这里选哪个" or "还有微信表情包" are scored
+    as cold-start projects and falsely enter plan mode.
+    """
+    from ..providers.base import message_text
+
+    turns: list[str] = []
+    for msg in messages or []:
+        role = getattr(msg, "role", None)
+        if role not in {"user", "assistant"}:
+            continue
+        meta = getattr(msg, "meta", None) or {}
+        if meta.get("compacted"):
+            continue
+        if role == "user":
+            text = _strip_classifier_noise(
+                str(meta.get("user_text") or message_text(msg.content) or "")
+            )
+        else:
+            text = (message_text(msg.content) or "").strip()
+            if not text:
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                if tool_calls:
+                    names = ", ".join(
+                        tc.name for tc in tool_calls[:6] if getattr(tc, "name", None)
+                    )
+                    text = f"(used tools: {names})" if names else "(used tools)"
+                else:
+                    continue
+        text = _strip_classifier_noise(text)
+        if not text:
+            continue
+        if len(text) > turn_chars:
+            text = text[: max(0, turn_chars - 1)] + "…"
+        turns.append(f"{role}: {text}")
+
+    if not turns:
+        return ""
+    blob = "\n".join(turns[-max_turns:])
+    if len(blob) > max_chars:
+        blob = "…" + blob[-(max_chars - 1) :]
+    return blob
+
 
 async def classify_request(
     request: str,
@@ -350,7 +429,8 @@ async def classify_request(
       request: What the user asked for.
       router: Router used to reach the classifier model.
       selection: Which model classifies.
-      context: Optional extra context, e.g. what the project is.
+      context: Recent conversation (preferred) and/or project notes. Scored
+        together with ``request`` so follow-ups are not treated as cold starts.
 
     Returns:
       A :class:`Classification`. On any failure the request is treated as
@@ -361,9 +441,9 @@ async def classify_request(
         "max_questions": MAX_CLARIFYING_QUESTIONS,
         "max_options": MAX_QUESTION_OPTIONS,
     }
-    user = f"Request:\n{request}"
+    user = f"New request:\n{request}"
     if context:
-        user += f"\n\nProject context:\n{context}"
+        user = f"Conversation so far:\n{context}\n\n{user}"
 
     try:
         reply = await router.ask(

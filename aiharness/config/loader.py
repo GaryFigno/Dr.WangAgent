@@ -401,7 +401,10 @@ workflows:
 context:
   compact_threshold: 0.82
   keep_recent_messages: 8
-  max_tool_result_chars: 30000
+  max_tool_result_chars: 12000
+  bash_success_chars: 2500
+  bash_error_chars: 6000
+  read_result_chars: 12000
   auto_compact: true
 
 ui:

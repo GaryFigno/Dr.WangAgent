@@ -466,8 +466,13 @@ class ContextConfig:
     # Prefer keeping about this many tokens of recent transcript verbatim
     # (grows the recent tail beyond keep_recent_messages when cheap).
     preserve_recent_tokens: int = 8_000
-    # Truncate any single tool result longer than this many characters.
-    max_tool_result_chars: int = 30000
+    # Absolute ceiling for any single tool result (disk + pre-digest).
+    max_tool_result_chars: int = 12_000
+    # Bash stdout/stderr kept for the model on success / failure (wire view).
+    bash_success_chars: int = 2_500
+    bash_error_chars: int = 6_000
+    # Read/Grep-style tools before prune; still capped by max_tool_result_chars.
+    read_result_chars: int = 12_000
     auto_compact: bool = True
     # Shrink older tool outputs before paying for an LLM summary.
     prune_tool_outputs: bool = True
@@ -484,6 +489,11 @@ class UIConfig:
     stream: bool = True
     #: When True and permission mode is yolo, Write/Edit skip the review queue.
     auto_apply_edits: bool = False
+    #: After a normal Done with open todos, start another turn automatically.
+    #: Off by default — unfinished work uses the Continue CTA instead.
+    auto_continue_open_todos: bool = False
+    #: Cap on automatic todo continuations per chat (resets when todos clear).
+    max_auto_continues: int = 3
 
 
 # --------------------------------------------------------------------------

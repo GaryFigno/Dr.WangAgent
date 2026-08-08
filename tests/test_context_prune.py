@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from aiharness.agent.context import PRUNED_TOOL_STUB, prune_old_tool_outputs
+from aiharness.agent.context import prune_old_tool_outputs
 from aiharness.providers.base import Message
 
 
@@ -34,8 +34,9 @@ def test_prune_stubs_old_tool_output_when_enough_is_reclaimed():
         keep_user_turns=2,
     )
     assert pruned >= 1
-    assert messages[2].content == PRUNED_TOOL_STUB
+    assert messages[2].content.startswith("[digest]")
     assert messages[2].meta.get("pruned") is True
+    assert messages[2].meta.get("full") == bulky
     assert messages[-1].content == "keep me"
 
 

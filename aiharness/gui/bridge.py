@@ -28,6 +28,7 @@ from ..agent.loop import (
 from ..agent.mesh import AgentMesh
 from ..config.schema import Config
 from ..constants import HEARTBEAT_DEFAULT_INTERVAL
+from ..edits import EditReviewBoard
 from ..mcp.manager import MCPManager
 from ..permissions import PermissionEngine, Verdict
 from ..providers import proxy
@@ -37,6 +38,8 @@ from ..setup import readiness, role_table
 from ..skills import SkillLibrary
 from ..skills import default_skill_roots as _skill_roots
 from ..toolset import build_registry
+from .claude_runtime import ClaudeRuntime
+from .codex_runtime import CodexRuntime, HOME_KIMI
 from .drafts import DraftStore
 from .protocol import (
     ConfigPayload,
@@ -56,6 +59,10 @@ class LiveTurn:
     task: asyncio.Task | None = None
     #: Last activity line for this turn (restored when the user switches back).
     last_activity: str = ""
+    #: Second interrupt (or shutdown) escalates to ``task.cancel()``.
+    hard_cancel: bool = False
+    #: True once ``Outbound.DONE`` was pushed for this turn (cancel-safe).
+    done_sent: bool = False
 
 
 @dataclass
@@ -99,8 +106,13 @@ class GuiSession:
         self.config = config
         self.workspace = workspace
         self._send = send
+        #: False while a browser is attached; True after detach (turns keep running).
+        self._client_detached = False
 
         self.router = Router(config)
+        # Provider retries were silent; tip the sticky activity dock so a
+        # brief outage does not look like a hung/dead send.
+        self.router.on_retry = self._progress
         self.permissions = PermissionEngine(config.permissions, workspace)
         self.skills = SkillLibrary(workspace, config.skill_paths).load()
         self.sessions = SessionStore()
@@ -108,9 +120,8 @@ class GuiSession:
         self.mcp = MCPManager(config.mcp_servers)
         self.mesh = AgentMesh()
         self.market, self.paper_book = self._build_market()
-        from ..edits import EditReviewBoard
-
-        self.edit_review = EditReviewBoard()
+        #: Per-chat edit review queues — two live turns must not share apply/reject.
+        self._edit_reviews: dict[str, EditReviewBoard] = {}
         #: Relative @ paths from the most recent user prompt.
         self.last_turn_refs: list[str] = []
         #: Turns still running after the user switched chats (keyed by id).
@@ -119,6 +130,10 @@ class GuiSession:
         self.session_todos: dict[str, list] = {}
         #: Session id of the turn currently streaming (viewed or background).
         self.stream_session_id: str | None = None
+        #: Quest verify retry to start after the current turn fully ends.
+        self._quest_retry_after: dict[str, str] = {}
+        #: Auto-continue chains started for open todos (keyed by session id).
+        self._auto_continues: dict[str, int] = {}
 
         self.session = self._new_session_handle()
         self.agent = self._build_agent()
@@ -146,6 +161,73 @@ class GuiSession:
         self._pending_hitl: dict[PendingKey, PendingHitl] = {}
         #: Legacy single-task slot; prefer :attr:`live` entries.
         self._turn_task: asyncio.Task | None = None
+        # Panels must not inherit the exe install cwd (…/dist/Dr.Wang).
+        from .workspace import preferred_project_workspace
+
+        panel_workspace = preferred_project_workspace(workspace)
+        #: Sibling Codex app-server runtime (independent of Agent loop).
+        self.codex = CodexRuntime(
+            workspace=panel_workspace,
+            push=self._push_codex,
+            park_approval=self._park_codex_approval,
+            home_kind=HOME_KIMI,
+            agent_accounts=lambda: list(self.config.accounts),
+        )
+        #: Sibling Claude Code runtime (stream-json host shell).
+        self.claude = ClaudeRuntime(
+            workspace=panel_workspace,
+            push=self._push_claude,
+            park_approval=self._park_claude_approval,
+            agent_accounts=lambda: list(self.config.accounts),
+        )
+
+    async def _push_codex(self, kind: str, payload: dict[str, Any]) -> None:
+        """Forward a Codex panel event onto the WebSocket bus."""
+        try:
+            outbound = Outbound(kind)
+        except ValueError:
+            outbound = Outbound.CODEX_NOTICE
+            payload = {"level": "warn", "text": f"unknown codex event {kind}", **payload}
+        await self.push(outbound, **payload)
+
+    async def _push_claude(self, kind: str, payload: dict[str, Any]) -> None:
+        try:
+            outbound = Outbound(kind)
+        except ValueError:
+            outbound = Outbound.CLAUDE_NOTICE
+            payload = {"level": "warn", "text": f"unknown claude event {kind}", **payload}
+        await self.push(outbound, **payload)
+
+    async def _park_codex_approval(self, info: dict[str, Any]) -> str | None:
+        """Ask the browser to approve a Codex command/file change."""
+        answer = await self._park(
+            Outbound.CODEX_PERMISSION,
+            session_id=str(info.get("panel_session_id") or "codex"),
+            tool=str(info.get("tool") or "Codex"),
+            reason=str(info.get("reason") or ""),
+            detail=str(info.get("detail") or ""),
+            kind=str(info.get("kind") or ""),
+            args={"detail": info.get("detail"), "params": info.get("params") or {}},
+            panel_session_id=str(info.get("panel_session_id") or ""),
+        )
+        if isinstance(answer, dict):
+            return str(answer.get("decision") or answer.get("value") or "")
+        return str(answer) if answer is not None else None
+
+    async def _park_claude_approval(self, info: dict[str, Any]) -> str | None:
+        answer = await self._park(
+            Outbound.CLAUDE_PERMISSION,
+            session_id=str(info.get("panel_session_id") or "claude"),
+            tool=str(info.get("tool") or "Claude Code"),
+            reason=str(info.get("reason") or ""),
+            detail=str(info.get("detail") or ""),
+            kind=str(info.get("kind") or ""),
+            args={"detail": info.get("detail"), "params": info.get("params") or {}},
+            panel_session_id=str(info.get("panel_session_id") or ""),
+        )
+        if isinstance(answer, dict):
+            return str(answer.get("decision") or answer.get("value") or "")
+        return str(answer) if answer is not None else None
 
     @property
     def busy(self) -> bool:
@@ -236,12 +318,14 @@ class GuiSession:
             skills=self.skills,
             session=target,
         )
-        # Restore this chat's task list (cleared when the agent object was replaced).
-        agent.ctx.todos = list(
+        # Restore this chat's task list (RAM cache, then durable todos.json).
+        restored = list(
             self.session_todos.get(target.meta.id)
             or getattr(target, "todos", None)
             or []
         )
+        agent.ctx.todos = restored
+        self.session_todos[target.meta.id] = list(restored)
         return agent
 
     def rebuild_tools(self) -> None:
@@ -304,10 +388,32 @@ class GuiSession:
         agent.ctx.make_session = self._make_child_session
         agent.ctx.market = self.market
         agent.ctx.paper_book = self.paper_book
-        agent.ctx.edit_review = self.edit_review
+        agent.ctx.edit_review = self.edit_board(sid)
 
-    async def push_edit_review(self) -> None:
-        await self.push(Outbound.EDIT_REVIEW, pending=self.edit_review.public())
+    def edit_board(self, session_id: str | None = None) -> EditReviewBoard:
+        """Return the Write/Edit review queue for one chat."""
+        sid = session_id or self.session.meta.id
+        board = self._edit_reviews.get(sid)
+        if board is None:
+            board = EditReviewBoard()
+            self._edit_reviews[sid] = board
+        return board
+
+    @property
+    def edit_review(self) -> EditReviewBoard:
+        """Review board for the currently viewed chat."""
+        return self.edit_board()
+
+    def drop_edit_board(self, session_id: str) -> None:
+        self._edit_reviews.pop(session_id, None)
+
+    async def push_edit_review(self, *, session_id: str | None = None) -> None:
+        sid = session_id or self.session.meta.id
+        await self.push(
+            Outbound.EDIT_REVIEW,
+            pending=self.edit_board(sid).public(),
+            session_id=sid,
+        )
 
     def _make_child_session(self, title: str):
         handle = self.sessions.create(self.workspace)
@@ -317,6 +423,39 @@ class GuiSession:
 
     # -- outbound ---------------------------------------------------------
 
+    def bind_send(self, send: Sender) -> None:
+        """Attach (or re-attach) the browser WebSocket sender."""
+        self._send = send
+        self._client_detached = False
+
+    async def detach_client(self) -> None:
+        """Browser left — keep live turns; abandon parked HITL prompts."""
+        self.cancel_pending()
+        self._client_detached = True
+
+        async def _noop(_payload: dict[str, Any]) -> None:
+            return None
+
+        self._send = _noop
+
+    async def on_client_attached(self) -> None:
+        """Push full UI state after connect / reconnect."""
+        await self.push_transcript()
+        await self.push_all()
+        await self.push_edit_review()
+        await self.push_pending_hitl()
+        await self.codex.push_status()
+        await self.claude.push_status()
+        viewed = self.session.meta.id
+        live = self.live.get(viewed)
+        if live is not None and live.last_activity:
+            await self.push(
+                Outbound.ACTIVITY,
+                text=live.last_activity,
+                source="main",
+                session_id=viewed,
+            )
+
     async def push(self, outbound: Outbound, **payload: Any) -> None:
         # Parameter must not be named ``kind`` — canvas/tool payloads use that key.
         sid = str(payload.get("session_id") or "")
@@ -324,7 +463,10 @@ class GuiSession:
             text = str(payload.get("text") or "").strip()
             if text:
                 self.note_activity(sid, text)
-        await self._send(message(outbound, **payload))
+        try:
+            await self._send(message(outbound, **payload))
+        except Exception:  # noqa: BLE001 — never kill a turn because the UI left
+            pass
 
     def note_activity(self, session_id: str, text: str) -> None:
         """Remember the latest activity line for a (possibly background) turn."""
@@ -379,6 +521,24 @@ class GuiSession:
             if not activity:
                 label = live.agent.selection.label() if live.agent else viewed_id
                 activity = f"{label} …"
+        todos = list(
+            self.session_todos.get(viewed_id)
+            or self.agent.ctx.todos
+            or self.session.todos
+            or []
+        )
+        open_todos = [
+            item
+            for item in todos
+            if str(item.get("status") or "") != "completed"
+        ]
+        from ..quest import load_quest
+
+        quest = load_quest(self.workspace, session_id=viewed_id)
+        quest_open = bool(
+            quest is not None and quest.status not in {"idle", "done"}
+        )
+        busy = viewed_id in self.live
         status = StatusPayload(
             model=self.agent.selection.model_id,
             account=self.agent.selection.account_id or "",
@@ -390,7 +550,7 @@ class GuiSession:
             run_cache_hit=self.agent.state.cache.hit_rate,
             session_cache_hit=self.session.meta.cache_hit_rate,
             cost=self.router.ledger.total_cost,
-            busy=viewed_id in self.live,
+            busy=busy,
             plan_mode=self.permissions.plan_mode,
             explore_mode=self.permissions.explore_mode,
             session_id=viewed_id,
@@ -409,6 +569,8 @@ class GuiSession:
             context_options=(model.context_windows if model else []),
             turn_refs=list(self.last_turn_refs),
             activity=activity,
+            resume_available=(not busy) and (bool(open_todos) or quest_open),
+            open_todo_count=len(open_todos),
         )
         await self.push(Outbound.STATUS, status=status.to_dict())
         await self.push_onboarding()
@@ -480,8 +642,10 @@ class GuiSession:
         kept the old contents, so a freshly opened project was missing from
         the sidebar until the next restart.
         """
-        from .workspace import RecentWorkspaces
+        from .workspace import RecentWorkspaces, is_app_install_workspace
 
+        if is_app_install_workspace(path):
+            return
         entry = str(path)
         recents = [p for p in self.recent_workspaces if p != entry]
         self.recent_workspaces = [entry, *recents][:RECENT_WORKSPACES]
@@ -816,8 +980,13 @@ class GuiSession:
         )
         from ..quest import load_quest
 
-        quest = load_quest(self.workspace)
-        await self.push(Outbound.QUEST, quest=quest.public() if quest else None)
+        sid = self.session.meta.id
+        quest = load_quest(self.workspace, session_id=sid)
+        await self.push(
+            Outbound.QUEST,
+            quest=quest.public() if quest else None,
+            session_id=sid,
+        )
 
     # -- human-in-the-loop ------------------------------------------------
 
@@ -845,7 +1014,21 @@ class GuiSession:
             timeout = configured
         try:
             return await asyncio.wait_for(future, timeout=timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError:
+            await self.push(
+                Outbound.NOTICE,
+                level="error",
+                text=self.msg("hitl.timeout"),
+                session_id=sid,
+            )
+            return None
+        except asyncio.CancelledError:
+            await self.push(
+                Outbound.NOTICE,
+                level="warn",
+                text=self.msg("hitl.disconnected"),
+                session_id=sid,
+            )
             return None
         finally:
             self._pending.pop(key, None)
@@ -1021,7 +1204,9 @@ class GuiSession:
 
         if self.busy:
             return ""  # a human turn is in flight; skip this beat
-        hint = quest_prompt_hint(self.workspace)
+        hint = quest_prompt_hint(
+            self.workspace, session_id=self.session.meta.id
+        )
         wired = f"{hint}{prompt}".strip() if hint else prompt
         return await run_turn(self, wired, automatic=True)
 
@@ -1051,13 +1236,18 @@ class GuiSession:
     # -- shutdown ---------------------------------------------------------
 
     async def close(self) -> None:
+        """Full process shutdown — cancels every live turn and closes clients."""
         self.heartbeat.stop(StopReason.USER_STOPPED)
         self.cancel_pending()
         for live in list(self.live.values()):
+            live.hard_cancel = True
             live.agent.interrupt()
             if live.task is not None:
                 live.task.cancel()
         if self._turn_task is not None:
             self._turn_task.cancel()
+        self.live.clear()
+        await self.codex.stop()
+        await self.claude.stop()
         await self.mcp.close()
         await self.router.aclose()

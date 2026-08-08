@@ -157,30 +157,72 @@ Do not describe your process or narrate which tools you used. Report findings.
 """
 
 
+#: Cap nested instruction files (root + subdirs).
+_MAX_INSTRUCTION_FILES = 8
+#: Cap total instruction characters injected into the system prompt.
+_MAX_INSTRUCTION_CHARS = 14_000
+
+
 def read_project_instructions(workspace: Path) -> str:
     """Return repository-supplied agent instructions, if any.
 
-    Args:
-      workspace: Directory to search for an instructions file.
-
-    Returns:
-      The formatted instruction block, or an empty string when no file exists.
+    Loads root ``AGENTS.md`` / ``CLAUDE.md`` first, then nested copies under
+    the workspace (Claude Code-style), skipping ignored directories.
     """
-    for name in PROJECT_INSTRUCTION_FILES:
-        path = workspace / name
-        if not path.is_file():
-            continue
+    from ..workspace.ignore import IgnoreMatcher
+
+    root = workspace.resolve()
+    matcher = IgnoreMatcher.for_workspace(root)
+    blocks: list[str] = []
+    total = 0
+
+    def _add(path: Path, label: str) -> None:
+        nonlocal total
+        if len(blocks) >= _MAX_INSTRUCTION_FILES or total >= _MAX_INSTRUCTION_CHARS:
+            return
         try:
             text = path.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeDecodeError):
-            continue
-        if text:
-            return (
-                f"# Project instructions ({name})\n\n"
-                f"These come from the repository and take precedence over your "
-                f"general habits.\n\n{text}"
-            )
-    return ""
+            return
+        if not text:
+            return
+        room = _MAX_INSTRUCTION_CHARS - total
+        if len(text) > room:
+            text = text[: room - 1] + "…"
+        blocks.append(
+            f"## {label}\n\n"
+            f"These come from the repository and take precedence over your "
+            f"general habits.\n\n{text}"
+        )
+        total += len(text)
+
+    for name in PROJECT_INSTRUCTION_FILES:
+        path = root / name
+        if path.is_file():
+            _add(path, name)
+
+    # Nested instruction files (skip roots already loaded).
+    seen = {str((root / name).resolve()) for name in PROJECT_INSTRUCTION_FILES}
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        for path in root.rglob(name):
+            if len(blocks) >= _MAX_INSTRUCTION_FILES:
+                break
+            try:
+                key = str(path.resolve())
+            except OSError:
+                continue
+            if key in seen or matcher.is_ignored(path):
+                continue
+            try:
+                rel = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            seen.add(key)
+            _add(path, rel)
+
+    if not blocks:
+        return ""
+    return "# Project instructions\n\n" + "\n\n".join(blocks)
 
 
 # Backwards-compatible alias used elsewhere in the package.
@@ -251,7 +293,7 @@ def build_system_prompt(
 
 
 def _git_summary(workspace: Path) -> str:
-    """Return a one-line git status summary, or an empty string."""
+    """Return a short git status block (branch, dirty paths, recent commits)."""
     if not shutil.which("git") or not (workspace / ".git").exists():
         return ""
     try:
@@ -274,18 +316,38 @@ def _git_summary(workspace: Path) -> str:
             check=False,
             **hidden,
         ).stdout.strip()
+        log = subprocess.run(
+            ["git", "log", "-5", "--oneline", "--no-decorate"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=GIT_COMMAND_TIMEOUT,
+            check=False,
+            **hidden,
+        ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
 
     if not branch:
         return ""
-    dirty = len(status.splitlines())
-    if dirty:
-        return f"git branch {branch}, {dirty} uncommitted change(s)"
-    return f"git branch {branch}, clean"
+    lines = [f"git branch {branch}"]
+    dirty_lines = [line for line in status.splitlines() if line.strip()]
+    if dirty_lines:
+        lines.append(f"{len(dirty_lines)} uncommitted change(s):")
+        for line in dirty_lines[:12]:
+            lines.append(f"  {line[:160]}")
+        if len(dirty_lines) > 12:
+            lines.append(f"  … {len(dirty_lines) - 12} more")
+    else:
+        lines.append("working tree clean")
+    if log:
+        lines.append("recent commits:")
+        for line in log.splitlines()[:5]:
+            lines.append(f"  {line[:120]}")
+    return "\n".join(lines)
 
 
-def build_environment_note(workspace: Path) -> str:
+def build_environment_note(workspace: Path, query: str = "") -> str:
     """Build the volatile environment block attached to the newest user turn.
 
     Kept out of the system prompt on purpose: the date and git state change
@@ -294,12 +356,18 @@ def build_environment_note(workspace: Path) -> str:
 
     Args:
       workspace: The agent's working directory.
+      query: Latest user text — used to rank an Aider-style repo map.
 
     Returns:
       A short markdown block, always non-empty.
     """
+    from ..workspace.repomap import build_repo_map
+
     lines = [f"Date: {date.today().isoformat()}"]
     git = _git_summary(workspace)
     if git:
         lines.append(git)
+    repo_map = build_repo_map(workspace, query)
+    if repo_map:
+        lines.append(repo_map)
     return "<environment>\n" + "\n".join(lines) + "\n</environment>"

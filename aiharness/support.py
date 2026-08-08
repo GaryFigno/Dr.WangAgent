@@ -7,10 +7,8 @@ URLs and relative asset paths belong here.
 from __future__ import annotations
 
 #: GitHub Sponsors page. Empty string hides the button until you set it.
-#: TODO: replace YOUR_GITHUB_USERNAME with your real username before the
-#: first public build / push (README badge and .github/FUNDING.yml too).
-#: Example: ``https://github.com/sponsors/your-username``
-GITHUB_SPONSORS_URL = "https://github.com/sponsors/YOUR_GITHUB_USERNAME"
+#: Keep README badge and .github/FUNDING.yml in sync when you change this.
+GITHUB_SPONSORS_URL = "https://github.com/sponsors/GaryFigno"
 
 #: Optional Chinese platforms (爱发电 etc.). Empty entries are hidden.
 CUSTOM_DONATE_URLS: list[tuple[str, str]] = [

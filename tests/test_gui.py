@@ -650,6 +650,29 @@ async def test_interrupt_uses_activity_not_sticky_notice(gui, sent):
     await gui.close()
 
 
+async def test_refresh_skips_transcript_replay_while_busy(gui, sent):
+    """Mid-turn READY wipe made streamed answers vanish until restart."""
+    from aiharness.gui.bridge import LiveTurn
+
+    sid = gui.session.meta.id
+    gui.live[sid] = LiveTurn(
+        session_id=sid, handle=gui.session, agent=gui.agent, task=None
+    )
+    sent.clear()
+    await gui_commands.dispatch(gui, Inbound.REFRESH, {})
+    assert not any(m.get("type") == "ready" for m in sent)
+
+    sent.clear()
+    await gui_commands.dispatch(gui, Inbound.REFRESH, {"transcript": True})
+    assert any(m.get("type") == "ready" for m in sent)
+
+    gui.live.pop(sid, None)
+    sent.clear()
+    await gui_commands.dispatch(gui, Inbound.REFRESH, {})
+    assert any(m.get("type") == "ready" for m in sent)
+    await gui.close()
+
+
 async def test_new_session_clears_sticky_plan_mode(gui, sent):
     """Plan mode lived on the GuiSession, so one project poisoned every chat."""
     gui.permissions.set_plan_mode(True)
@@ -1672,3 +1695,107 @@ async def test_turn_events_carry_session_id(gui, sent, fake):
     texts = [m for m in sent if m["type"] == "text"]
     assert texts and all(m.get("session_id") == gui.session.meta.id for m in texts)
     await gui.close()
+
+
+async def test_run_turn_hard_cancel_emits_terminal_done(gui, sent, monkeypatch):
+    """Force-cancel must push DONE so the UI leaves '正在打断…'."""
+
+    async def hang(_self, _text):
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise
+        if False:  # pragma: no cover — keep this an async generator
+            yield
+
+    monkeypatch.setattr(type(gui.agent), "run", hang)
+    task = asyncio.create_task(gui_commands.run_turn(gui, "hi"))
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if gui.session.meta.id in gui.live:
+            break
+    assert gui.session.meta.id in gui.live
+    await gui_commands.dispatch(gui, Inbound.INTERRUPT, {"force": True})
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    done = last(sent, "done")
+    assert done["interrupted"] is True
+    assert gui.session.meta.id not in gui.live
+    await gui.close()
+
+
+async def test_detach_client_keeps_live_turns(gui, sent):
+    from aiharness.gui.bridge import LiveTurn
+
+    sid = gui.session.meta.id
+    gui.live[sid] = LiveTurn(
+        session_id=sid, handle=gui.session, agent=gui.agent, task=None
+    )
+    await gui.detach_client()
+    assert sid in gui.live
+    assert gui._client_detached is True
+    # Re-attach must restore push without recreating the runtime.
+    async def send(payload):
+        sent.append(payload)
+
+    gui.bind_send(send)
+    await gui.on_client_attached()
+    assert last(sent, "status")["status"]["busy"] is True
+    gui.live.pop(sid, None)
+    await gui.close()
+
+
+async def test_edit_boards_are_isolated_per_session(gui):
+    a = gui.edit_board("session-a")
+    b = gui.edit_board("session-b")
+    assert a is not b
+    assert gui.edit_board("session-a") is a
+    await gui.close()
+
+
+async def test_todos_persist_across_rebuild(gui, workspace):
+    todos = [
+        {"content": "one", "status": "completed", "activeForm": "one"},
+        {"content": "two", "status": "in_progress", "activeForm": "two"},
+    ]
+    gui.session.save_todos(todos)
+    reopened = gui.sessions.open(gui.session.meta.id)
+    assert reopened is not None
+    assert [t["content"] for t in reopened.todos] == ["one", "two"]
+    assert reopened.todos[1]["status"] == "in_progress"
+    await gui.close()
+
+
+async def test_continue_work_starts_turn_from_open_todos(gui, sent, fake):
+    from .fake_openai import Reply
+
+    gui.session.save_todos(
+        [{"content": "finish docs", "status": "pending", "activeForm": "docs"}]
+    )
+    gui.agent.ctx.todos = list(gui.session.todos)
+    gui.session_todos[gui.session.meta.id] = list(gui.session.todos)
+    fake.push(Reply(text="continued"))
+    await gui_commands.dispatch(gui, Inbound.CONTINUE_WORK, {})
+    assert gui._turn_task is not None
+    await gui._turn_task
+    assert any(m.get("type") == "turn_start" for m in sent)
+    await gui.close()
+
+
+async def test_interrupt_idle_does_not_claim_interrupted(gui, sent):
+    await gui_commands.dispatch(gui, Inbound.INTERRUPT, {})
+    notice = last(sent, "notice")
+    assert "没有进行中" in notice["text"] or "Nothing is running" in notice["text"]
+    await gui.close()
+
+
+async def test_quest_files_are_session_scoped(tmp_path):
+    from aiharness.quest import load_quest, quest_path, start_quest
+
+    start_quest(tmp_path, "A", ["step"], session_id="chat-a")
+    start_quest(tmp_path, "B", ["step"], session_id="chat-b")
+    assert quest_path(tmp_path, session_id="chat-a") != quest_path(
+        tmp_path, session_id="chat-b"
+    )
+    assert load_quest(tmp_path, session_id="chat-a").goal == "A"
+    assert load_quest(tmp_path, session_id="chat-b").goal == "B"

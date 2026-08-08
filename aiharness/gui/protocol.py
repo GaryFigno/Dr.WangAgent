@@ -66,6 +66,28 @@ class Outbound(str, Enum):
     QUEST = "quest"
     SCREENSHOT = "screenshot"  # composer capture result (base64 image)
     ERROR = "error"
+    # Codex panel (sibling runtime via codex app-server)
+    CODEX_STATUS = "codex_status"
+    CODEX_TEXT = "codex_text"
+    CODEX_NOTICE = "codex_notice"
+    CODEX_PERMISSION = "codex_permission"
+    CODEX_DONE = "codex_done"
+    CODEX_ERROR = "codex_error"
+    CODEX_ACTIVITY = "codex_activity"
+    CODEX_TOOL_START = "codex_tool_start"
+    CODEX_TOOL_END = "codex_tool_end"
+    CODEX_THINKING = "codex_thinking"
+    # Claude Code panel
+    CLAUDE_STATUS = "claude_status"
+    CLAUDE_TEXT = "claude_text"
+    CLAUDE_NOTICE = "claude_notice"
+    CLAUDE_PERMISSION = "claude_permission"
+    CLAUDE_DONE = "claude_done"
+    CLAUDE_ERROR = "claude_error"
+    CLAUDE_ACTIVITY = "claude_activity"
+    CLAUDE_TOOL_START = "claude_tool_start"
+    CLAUDE_TOOL_END = "claude_tool_end"
+    CLAUDE_THINKING = "claude_thinking"
 
 
 class Inbound(str, Enum):
@@ -142,12 +164,55 @@ class Inbound(str, Enum):
     START_QUEST = "start_quest"
     QUEST_STEP = "quest_step"
     RESUME_QUEST = "resume_quest"
+    CONTINUE_WORK = "continue_work"  # resume open todos / quest in one click
     CLEAR_QUEST = "clear_quest"
     NEW_WINDOW = "new_window"
     SAVE_CANVAS = "save_canvas"
     CAPTURE_SCREEN = "capture_screen"  # user screenshot → composer attach
     OPEN_URL = "open_url"  # open http(s) in the system browser
     SET_MODEL_VISION = "set_model_vision"  # auto | on | off
+    # Codex panel
+    CODEX_SET_HOME = "codex_set_home"
+    CODEX_SET_PROFILE = "codex_set_profile"
+    CODEX_UPSERT_PROFILE = "codex_upsert_profile"
+    CODEX_DELETE_PROFILE = "codex_delete_profile"
+    CODEX_IMPORT_ACCOUNT = "codex_import_account"
+    CODEX_START = "codex_start"
+    CODEX_STOP = "codex_stop"
+    CODEX_PROMPT = "codex_prompt"
+    CODEX_INTERRUPT = "codex_interrupt"
+    CODEX_APPROVE = "codex_approve"
+    CODEX_SET_MODEL = "codex_set_model"
+    CODEX_SET_EFFORT = "codex_set_effort"
+    CODEX_SET_MODE = "codex_set_mode"
+    CODEX_NEW_SESSION = "codex_new_session"
+    CODEX_OPEN_SESSION = "codex_open_session"
+    CODEX_DELETE_SESSION = "codex_delete_session"
+    CODEX_ARCHIVE_SESSION = "codex_archive_session"
+    CODEX_SET_WORKSPACE = "codex_set_workspace"
+    CODEX_FORGET_WORKSPACE = "codex_forget_workspace"
+    CODEX_TOGGLE_ARCHIVED = "codex_toggle_archived"
+    # Claude Code panel
+    CLAUDE_SET_PROFILE = "claude_set_profile"
+    CLAUDE_UPSERT_PROFILE = "claude_upsert_profile"
+    CLAUDE_DELETE_PROFILE = "claude_delete_profile"
+    CLAUDE_IMPORT_ACCOUNT = "claude_import_account"
+    CLAUDE_START = "claude_start"
+    CLAUDE_STOP = "claude_stop"
+    CLAUDE_PROMPT = "claude_prompt"
+    CLAUDE_INTERRUPT = "claude_interrupt"
+    CLAUDE_APPROVE = "claude_approve"
+    CLAUDE_SET_MODEL = "claude_set_model"
+    CLAUDE_SET_EFFORT = "claude_set_effort"
+    CLAUDE_SET_MODE = "claude_set_mode"
+    CLAUDE_LOGIN = "claude_login"
+    CLAUDE_NEW_SESSION = "claude_new_session"
+    CLAUDE_OPEN_SESSION = "claude_open_session"
+    CLAUDE_DELETE_SESSION = "claude_delete_session"
+    CLAUDE_ARCHIVE_SESSION = "claude_archive_session"
+    CLAUDE_SET_WORKSPACE = "claude_set_workspace"
+    CLAUDE_FORGET_WORKSPACE = "claude_forget_workspace"
+    CLAUDE_TOGGLE_ARCHIVED = "claude_toggle_archived"
 
 
 def message(outbound: Outbound, **payload: Any) -> dict[str, Any]:
@@ -209,6 +274,10 @@ class StatusPayload:
     #: Sticky activity line for the viewed session when it is busy (so a
     #: switch-back can restore "k3@Kimi 思考中…" instead of an empty dock).
     activity: str = ""
+    #: True when the open chat has unfinished todos/quest and is idle.
+    resume_available: bool = False
+    #: Count of incomplete TodoWrite items (for the continue CTA label).
+    open_todo_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -27,6 +27,71 @@ RECENTS_FILE = "workspaces.json"
 #: How many recent projects are remembered.
 MAX_RECENTS = 12
 
+
+def is_app_install_workspace(path: Path | str) -> bool:
+    """True for the Dr.Wang bundle / launch folder — not a user project.
+
+    Double-clicking ``Dr.Wang.exe`` makes that folder the process cwd. Panels
+    must not treat it as the open project or invent empty sidebar entries.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError:
+        return False
+    name = resolved.name.lower()
+    # Packaged layout: …/dist/Dr.Wang/Dr.Wang.exe
+    if name in {"dr.wang", "drwang"}:
+        return True
+    if (resolved / "Dr.Wang.exe").is_file() or (resolved / "aih.exe").is_file():
+        return True
+    if getattr(sys, "frozen", False):
+        try:
+            exe_dir = Path(sys.executable).resolve().parent
+            if resolved == exe_dir:
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def preferred_project_workspace(fallback: Path | None = None) -> Path:
+    """Best workspace for Codex/Claude panels on launch.
+
+    Prefer a remembered project or an existing panel session — never the
+    app install directory the exe happened to start in.
+    """
+    candidates: list[Path] = []
+    for raw in RecentWorkspaces.load().existing():
+        candidates.append(Path(raw))
+    for kind in ("codex", "claude"):
+        try:
+            from .panel_sessions import PanelSessionStore
+
+            store = PanelSessionStore(kind)  # type: ignore[arg-type]
+            for meta in store.list(include_archived=False):
+                if meta.workspace:
+                    candidates.append(Path(meta.workspace))
+        except Exception:  # noqa: BLE001
+            pass
+    if fallback is not None:
+        candidates.append(Path(fallback))
+    candidates.append(Path.home())
+
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            continue
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if not resolved.is_dir() or is_app_install_workspace(resolved):
+            continue
+        return resolved
+    return Path.home()
+
 @dataclass
 class _WindowHolder:
     """Holds the desktop window, if there is one.
@@ -146,6 +211,8 @@ class RecentWorkspaces:
 
     def remember(self, directory: Path) -> None:
         """Move a directory to the front of the list."""
+        if is_app_install_workspace(directory):
+            return
         entry = str(directory)
         self.paths = [entry] + [p for p in self.paths if p != entry]
         del self.paths[MAX_RECENTS:]
@@ -156,4 +223,8 @@ class RecentWorkspaces:
         A list full of deleted folders is worse than no list: every entry is
         a click that fails.
         """
-        return [p for p in self.paths if Path(p).is_dir()]
+        return [
+            p
+            for p in self.paths
+            if Path(p).is_dir() and not is_app_install_workspace(p)
+        ]

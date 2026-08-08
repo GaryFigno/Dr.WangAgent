@@ -163,36 +163,71 @@ def copy_capture_to_clipboard(shot: ScreenCapture) -> None:
 
 
 def _copy_image_windows(image) -> None:
+    """Put a DIB on the clipboard, retrying when another app holds the lock."""
     import ctypes
+    import time as _time
 
     # CF_DIB wants a BMP without the 14-byte file header.
     buf = io.BytesIO()
     image.convert("RGB").save(buf, "BMP")
     dib = buf.getvalue()[14:]
+    if not dib:
+        raise CaptureError("截屏数据为空，无法写入剪贴板")
 
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     cf_dib = 8
     gmem_moveable = 0x0002
+    last_error = "无法打开剪贴板"
 
-    if not user32.OpenClipboard(None):
-        raise CaptureError("无法打开剪贴板")
-    try:
-        user32.EmptyClipboard()
-        handle = kernel32.GlobalAlloc(gmem_moveable, len(dib))
-        if not handle:
-            raise CaptureError("剪贴板内存分配失败")
-        locked = kernel32.GlobalLock(handle)
-        if not locked:
-            kernel32.GlobalFree(handle)
-            raise CaptureError("剪贴板内存锁定失败")
-        ctypes.memmove(locked, dib, len(dib))
-        kernel32.GlobalUnlock(handle)
-        if not user32.SetClipboardData(cf_dib, handle):
-            kernel32.GlobalFree(handle)
-            raise CaptureError("写入剪贴板失败")
-    finally:
-        user32.CloseClipboard()
+    for attempt in range(8):
+        if not user32.OpenClipboard(None):
+            last_error = "无法打开剪贴板（可能被其他程序占用）"
+            _time.sleep(0.05 * (attempt + 1))
+            continue
+        handle = None
+        try:
+            user32.EmptyClipboard()
+            handle = kernel32.GlobalAlloc(gmem_moveable, len(dib))
+            if not handle:
+                last_error = "剪贴板内存分配失败"
+                continue
+            locked = kernel32.GlobalLock(handle)
+            if not locked:
+                kernel32.GlobalFree(handle)
+                handle = None
+                last_error = "剪贴板内存锁定失败"
+                _time.sleep(0.05 * (attempt + 1))
+                continue
+            ctypes.memmove(locked, dib, len(dib))
+            kernel32.GlobalUnlock(handle)
+            if not user32.SetClipboardData(cf_dib, handle):
+                kernel32.GlobalFree(handle)
+                handle = None
+                last_error = "写入剪贴板失败"
+                continue
+            # Ownership transferred to the clipboard — do not free.
+            handle = None
+            return
+        finally:
+            user32.CloseClipboard()
+            if handle:
+                kernel32.GlobalFree(handle)
+        _time.sleep(0.05 * (attempt + 1))
+    raise CaptureError(last_error)
+
+
+def save_capture_fallback(shot: ScreenCapture) -> str:
+    """Persist a screenshot when the clipboard is unavailable. Returns path."""
+    from pathlib import Path
+
+    from platformdirs import user_data_dir
+
+    folder = Path(user_data_dir("aiharness", appauthor=False)) / "screenshots"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / shot.name
+    path.write_bytes(shot.data)
+    return str(path)
 
 
 def _copy_image_macos(image) -> None:

@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from ..tools.fs import IGNORED_DIRS
+from ..workspace.ignore import IgnoreMatcher
 
 #: Max files whose contents we snapshot before a Bash call.
 SIDE_EFFECT_SNAPSHOT_LIMIT = 120
@@ -14,10 +14,6 @@ SIDE_EFFECT_SNAPSHOT_LIMIT = 120
 SIDE_EFFECT_MAX_BYTES = 256_000
 #: Max changed files queued into the review board per Bash call.
 SIDE_EFFECT_REVIEW_LIMIT = 20
-
-
-def _ignored(path: Path) -> bool:
-    return any(part in IGNORED_DIRS for part in path.parts)
 
 
 def _file_hash(data: bytes) -> str:
@@ -30,10 +26,11 @@ def snapshot_workspace(workspace: Path) -> dict[str, dict[str, Any]]:
     if not root.is_dir():
         return {}
     snaps: dict[str, dict[str, Any]] = {}
+    matcher = IgnoreMatcher.for_workspace(root)
     for path in root.rglob("*"):
         if len(snaps) >= SIDE_EFFECT_SNAPSHOT_LIMIT:
             break
-        if not path.is_file() or _ignored(path):
+        if not path.is_file() or matcher.is_ignored(path):
             continue
         try:
             size = path.stat().st_size

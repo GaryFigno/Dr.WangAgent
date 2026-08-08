@@ -45,7 +45,10 @@ class GuiServer:
         self.token = secrets.token_urlsafe(24)
         self.port = 0
         self._runner: web.AppRunner | None = None
+        #: Socket → view (all sockets share one process runtime).
         self._sessions: dict[web.WebSocketResponse, GuiSession] = {}
+        #: Survives WebSocket blips so background turns keep running.
+        self._runtime: GuiSession | None = None
 
     # -- lifecycle --------------------------------------------------------
 
@@ -81,9 +84,10 @@ class GuiServer:
         return self.url
 
     async def stop(self) -> None:
-        for session in list(self._sessions.values()):
-            await session.close()
         self._sessions.clear()
+        if self._runtime is not None:
+            await self._runtime.close()
+            self._runtime = None
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -160,16 +164,26 @@ class GuiServer:
             if not socket_response.closed:
                 await socket_response.send_json(payload)
 
-        session = GuiSession(self.config, self.workspace, send)
+        # Reuse the process runtime across reconnects so live turns survive
+        # a WebView refresh / brief socket drop.
+        if self._runtime is None:
+            self._runtime = GuiSession(self.config, self.workspace, send)
+        else:
+            self._runtime.bind_send(send)
+        session = self._runtime
         self._sessions[socket_response] = session
 
         try:
             await send(message(Outbound.READY, protocol=PROTOCOL_VERSION, transcript=[]))
-            await session.push_all()
+            await session.on_client_attached()
             await self._pump(socket_response, session)
         finally:
             self._sessions.pop(socket_response, None)
-            await session.close()
+            # Detach only when no other socket still owns this runtime.
+            if session is self._runtime and not any(
+                guest is session for guest in self._sessions.values()
+            ):
+                await session.detach_client()
         return socket_response
 
     async def _pump(
@@ -187,10 +201,10 @@ class GuiServer:
             await dispatch(session, command, args)
 
     def any_session(self) -> GuiSession | None:
-        """Return one live browser session, if any."""
+        """Return the process runtime (even briefly detached) or None."""
         for session in self._sessions.values():
             return session
-        return None
+        return self._runtime
 
     async def push_screenshot_to_clients(self, shot) -> bool:
         """Deliver a captured image to every connected UI (opens the editor)."""

@@ -6,7 +6,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..tools.fs import IGNORED_DIRS
+from .ignore import (
+    TREE_VISIBLE_DOT_DIRS,
+    IgnoreMatcher,
+    git_tracked_and_visible_files,
+)
 
 #: Cap on indexed file paths returned to the GUI.
 PATH_INDEX_LIMIT = 2000
@@ -24,19 +28,16 @@ PATH_INDEX_MAX_AGE_SECONDS = 60.0
 _cache: dict[str, Any] = {"root": "", "stamp": 0.0, "built": 0.0, "entries": []}
 
 
-def _ignored(path: Path) -> bool:
-    return any(part in IGNORED_DIRS for part in path.parts)
-
-
 def _root_stamp(root: Path) -> float:
     """Cheap invalidation signal: root mtime + shallow child mtimes."""
     try:
         stamp = root.stat().st_mtime
     except OSError:
         return 0.0
+    matcher = IgnoreMatcher.for_workspace(root)
     try:
         for entry in root.iterdir():
-            if entry.name in IGNORED_DIRS:
+            if matcher.skip_dir(entry) if entry.is_dir() else matcher.is_ignored(entry):
                 continue
             try:
                 stamp = max(stamp, entry.stat().st_mtime)
@@ -49,24 +50,46 @@ def _root_stamp(root: Path) -> float:
 
 def _build_index(root: Path, limit: int) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    for path in root.rglob("*"):
-        if len(entries) >= limit:
-            break
-        if _ignored(path):
-            continue
-        try:
-            rel = path.relative_to(root).as_posix()
-            mtime = path.stat().st_mtime
-        except (ValueError, OSError):
-            continue
-        entries.append(
-            {
-                "path": rel,
-                "kind": "dir" if path.is_dir() else "file",
-                "mtime": mtime,
-            }
-        )
-    entries.sort(key=lambda item: (-float(item["mtime"]), item["kind"] != "dir", item["path"].lower()))
+    git_files = git_tracked_and_visible_files(root)
+    if git_files is not None:
+        for rel in git_files:
+            if len(entries) >= limit:
+                break
+            path = root / rel
+            try:
+                mtime = path.stat().st_mtime
+                is_dir = path.is_dir()
+            except OSError:
+                continue
+            entries.append(
+                {
+                    "path": rel.replace("\\", "/"),
+                    "kind": "dir" if is_dir else "file",
+                    "mtime": mtime,
+                }
+            )
+    else:
+        matcher = IgnoreMatcher.for_workspace(root)
+        for path in root.rglob("*"):
+            if len(entries) >= limit:
+                break
+            if matcher.is_ignored(path):
+                continue
+            try:
+                rel = path.relative_to(root).as_posix()
+                mtime = path.stat().st_mtime
+            except (ValueError, OSError):
+                continue
+            entries.append(
+                {
+                    "path": rel,
+                    "kind": "dir" if path.is_dir() else "file",
+                    "mtime": mtime,
+                }
+            )
+    entries.sort(
+        key=lambda item: (-float(item["mtime"]), item["kind"] != "dir", item["path"].lower())
+    )
     return entries
 
 
@@ -87,11 +110,8 @@ def list_paths(
     """Return relative paths under ``workspace`` for @ completion.
 
     Uses an incremental cache keyed by a shallow directory stamp so large
-    trees are not fully walked on every keystroke.
-
-    Args:
-      kind: Optional ``file`` or ``dir`` filter.
-      ext: Optional extension filter such as ``.py`` or ``py``.
+    trees are not fully walked on every keystroke. Prefers ``git ls-files``
+    with exclude-standard when the workspace is a git checkout.
     """
     root = workspace.resolve()
     if not root.is_dir():
@@ -102,8 +122,6 @@ def list_paths(
     root_changed = _cache.get("root") != root_key
     stamp_changed = _cache.get("stamp") != stamp
     stale = now - float(_cache.get("built") or 0) > PATH_INDEX_MAX_AGE_SECONDS
-    # Root/stamp changes must rebuild immediately; the min interval only
-    # throttles redundant walks of the same tree under rapid keystrokes.
     if root_changed or stamp_changed:
         _cache["root"] = root_key
         _cache["stamp"] = stamp
@@ -144,6 +162,7 @@ def list_tree(workspace: Path, *, rel: str = "", limit: int = TREE_NODE_LIMIT) -
         return []
     if not target.is_dir():
         return []
+    matcher = IgnoreMatcher.for_workspace(root)
     nodes: list[dict[str, Any]] = []
     try:
         entries = sorted(
@@ -153,9 +172,12 @@ def list_tree(workspace: Path, *, rel: str = "", limit: int = TREE_NODE_LIMIT) -
     except OSError:
         return []
     for entry in entries:
-        if entry.name in IGNORED_DIRS or entry.name.startswith("."):
-            if entry.name not in {".aiharness", ".github"}:
-                continue
+        if entry.name.startswith(".") and entry.name not in TREE_VISIBLE_DOT_DIRS:
+            continue
+        if entry.is_dir() and matcher.skip_dir(entry):
+            continue
+        if entry.is_file() and matcher.is_ignored(entry):
+            continue
         if len(nodes) >= limit:
             break
         try:

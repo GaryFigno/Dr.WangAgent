@@ -1,4 +1,10 @@
-"""Lightweight Quest: goal + steps with resume (local, no cloud)."""
+"""Lightweight Quest: goal + steps with resume (local, no cloud).
+
+Quests are scoped per chat when ``session_id`` is provided
+(``.aiharness/quests/<session_id>.json``). The legacy workspace-wide
+``.aiharness/quest.json`` remains the default for callers that omit it
+(tests and older tooling).
+"""
 
 from __future__ import annotations
 
@@ -9,10 +15,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from .constants import QUEST_STEP_MAX_RETRIES
+
 QuestStatus = Literal["idle", "active", "blocked", "done"]
 StepStatus = Literal["pending", "active", "done", "failed"]
 
 QUEST_REL = Path(".aiharness") / "quest.json"
+QUESTS_DIR = Path(".aiharness") / "quests"
 
 
 @dataclass
@@ -21,6 +30,7 @@ class QuestStep:
     title: str
     status: StepStatus = "pending"
     note: str = ""
+    attempts: int = 0
 
     def public(self) -> dict[str, Any]:
         return asdict(self)
@@ -34,6 +44,11 @@ class Quest:
     blocked_reason: str = ""
     steps: list[QuestStep] = field(default_factory=list)
     updated_at: float = field(default_factory=time.time)
+    #: Owning chat id when scoped; empty for legacy workspace-wide quests.
+    session_id: str = ""
+    #: Set by sync_quest_from_verify when a failure was auto-retried; the GUI
+    #: consumes it to start the next turn. Never persisted (public() omits it).
+    retry_pending: bool = False
 
     def public(self) -> dict[str, Any]:
         return {
@@ -44,6 +59,7 @@ class Quest:
             "steps": [s.public() for s in self.steps],
             "updated_at": self.updated_at,
             "active_step": self.active_step_title(),
+            "session_id": self.session_id,
         }
 
     def active_step_title(self) -> str:
@@ -53,12 +69,14 @@ class Quest:
         return ""
 
 
-def quest_path(workspace: Path) -> Path:
+def quest_path(workspace: Path, *, session_id: str = "") -> Path:
+    if session_id:
+        return workspace / QUESTS_DIR / f"{session_id}.json"
     return workspace / QUEST_REL
 
 
-def load_quest(workspace: Path) -> Quest | None:
-    path = quest_path(workspace)
+def load_quest(workspace: Path, *, session_id: str = "") -> Quest | None:
+    path = quest_path(workspace, session_id=session_id)
     if not path.is_file():
         return None
     try:
@@ -73,6 +91,7 @@ def load_quest(workspace: Path) -> Quest | None:
             title=str(s.get("title", "")),
             status=s.get("status") or "pending",  # type: ignore[arg-type]
             note=str(s.get("note") or ""),
+            attempts=int(s.get("attempts") or 0),
         )
         for s in (raw.get("steps") or [])
         if isinstance(s, dict) and s.get("title")
@@ -84,24 +103,37 @@ def load_quest(workspace: Path) -> Quest | None:
         blocked_reason=str(raw.get("blocked_reason") or ""),
         steps=steps,
         updated_at=float(raw.get("updated_at") or time.time()),
+        session_id=str(raw.get("session_id") or session_id or ""),
     )
 
 
-def save_quest(workspace: Path, quest: Quest | None) -> None:
-    path = quest_path(workspace)
+def save_quest(
+    workspace: Path, quest: Quest | None, *, session_id: str = ""
+) -> None:
+    sid = session_id or (quest.session_id if quest is not None else "")
+    path = quest_path(workspace, session_id=sid)
     if quest is None:
         path.unlink(missing_ok=True)
         return
+    if sid and not quest.session_id:
+        quest.session_id = sid
     path.parent.mkdir(parents=True, exist_ok=True)
     quest.updated_at = time.time()
-    path.write_text(json.dumps(quest.public(), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(quest.public(), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    tmp.replace(path)
 
 
-def start_quest(workspace: Path, goal: str, steps: list[str]) -> Quest:
+def start_quest(
+    workspace: Path, goal: str, steps: list[str], *, session_id: str = ""
+) -> Quest:
     quest = Quest(
         id=uuid.uuid4().hex[:8],
         goal=goal.strip(),
         status="active",
+        session_id=session_id,
         steps=[
             QuestStep(
                 id=uuid.uuid4().hex[:6],
@@ -113,8 +145,10 @@ def start_quest(workspace: Path, goal: str, steps: list[str]) -> Quest:
         ],
     )
     if not quest.steps:
-        quest.steps = [QuestStep(id=uuid.uuid4().hex[:6], title="执行目标", status="active")]
-    save_quest(workspace, quest)
+        quest.steps = [
+            QuestStep(id=uuid.uuid4().hex[:6], title="执行目标", status="active")
+        ]
+    save_quest(workspace, quest, session_id=session_id)
     return quest
 
 
@@ -125,8 +159,9 @@ def set_step_status(
     *,
     note: str = "",
     blocked_reason: str = "",
+    session_id: str = "",
 ) -> Quest | None:
-    quest = load_quest(workspace)
+    quest = load_quest(workspace, session_id=session_id)
     if quest is None:
         return None
     for step in quest.steps:
@@ -143,7 +178,6 @@ def set_step_status(
         quest.blocked_reason = blocked_reason or note or "步骤失败"
     elif status == "done":
         quest.blocked_reason = ""
-        # Advance: mark next pending as active
         for step in quest.steps:
             if step.status == "pending":
                 step.status = "active"
@@ -157,19 +191,20 @@ def set_step_status(
     else:
         quest.status = "active"
         quest.blocked_reason = ""
-    save_quest(workspace, quest)
+    save_quest(workspace, quest, session_id=session_id)
     return quest
 
 
-def resume_quest(workspace: Path) -> Quest | None:
+def resume_quest(workspace: Path, *, session_id: str = "") -> Quest | None:
     """Clear blocked state and focus the first failed/pending step."""
-    quest = load_quest(workspace)
+    quest = load_quest(workspace, session_id=session_id)
     if quest is None:
         return None
     for step in quest.steps:
         if step.status == "failed":
             step.status = "active"
             step.note = ""
+            step.attempts = 0
             break
         if step.status == "pending":
             step.status = "active"
@@ -178,12 +213,12 @@ def resume_quest(workspace: Path) -> Quest | None:
             break
     quest.status = "active"
     quest.blocked_reason = ""
-    save_quest(workspace, quest)
+    save_quest(workspace, quest, session_id=session_id)
     return quest
 
 
-def quest_prompt_hint(workspace: Path) -> str:
-    quest = load_quest(workspace)
+def quest_prompt_hint(workspace: Path, *, session_id: str = "") -> str:
+    quest = load_quest(workspace, session_id=session_id)
     if quest is None or quest.status in {"idle", "done"}:
         return ""
     active = quest.active_step_title() or "(无步骤)"
@@ -194,14 +229,15 @@ def quest_prompt_hint(workspace: Path) -> str:
     )
 
 
-def sync_quest_from_todos(workspace: Path, todos: list[dict[str, Any]]) -> Quest | None:
+def sync_quest_from_todos(
+    workspace: Path, todos: list[dict[str, Any]], *, session_id: str = ""
+) -> Quest | None:
     """Mirror TodoWrite into an active Quest (create steps if needed)."""
-    quest = load_quest(workspace)
+    quest = load_quest(workspace, session_id=session_id)
     if quest is None or quest.status in {"idle", "done"}:
         return None
     if not todos:
         return quest
-    # Align step statuses by order when counts match; otherwise keep quest steps.
     if len(todos) == len(quest.steps):
         for step, todo in zip(quest.steps, todos, strict=True):
             status = str(todo.get("status", "pending"))
@@ -216,9 +252,8 @@ def sync_quest_from_todos(workspace: Path, todos: list[dict[str, Any]]) -> Quest
             quest.blocked_reason = ""
         elif all(s.status == "done" for s in quest.steps):
             quest.status = "done"
-        save_quest(workspace, quest)
+        save_quest(workspace, quest, session_id=session_id)
         return quest
-    # Partial sync: mark active todo title as active step when titles overlap.
     active_titles = {
         str(t.get("content", "")).strip().lower()
         for t in todos
@@ -237,15 +272,19 @@ def sync_quest_from_todos(workspace: Path, todos: list[dict[str, Any]]) -> Quest
             step.status = "active"
             quest.status = "active"
             quest.blocked_reason = ""
-    save_quest(workspace, quest)
+    save_quest(workspace, quest, session_id=session_id)
     return quest
 
 
 def sync_quest_from_verify(
-    workspace: Path, *, verdict: str, failures: int = 0
+    workspace: Path,
+    *,
+    verdict: str,
+    failures: int = 0,
+    session_id: str = "",
 ) -> Quest | None:
     """Mark the active Quest step failed/done from a Verify result."""
-    quest = load_quest(workspace)
+    quest = load_quest(workspace, session_id=session_id)
     if quest is None or quest.status in {"idle", "done"}:
         return None
     active = next((s for s in quest.steps if s.status == "active"), None)
@@ -258,13 +297,26 @@ def sync_quest_from_verify(
         failures > 0 and "PASS" not in upper and "UNKNOWN" not in upper
     )
     if failed:
-        return set_step_status(
-            workspace,
-            active.id,
-            "failed",
-            note=verdict,
-            blocked_reason=f"Verify: {verdict}",
-        )
+        active.attempts += 1
+        if active.attempts <= QUEST_STEP_MAX_RETRIES:
+            active.status = "active"
+            active.note = (
+                f"Verify 失败（第 {active.attempts}/{QUEST_STEP_MAX_RETRIES} 次），"
+                f"自动重试：{verdict}"
+            )
+            quest.status = "active"
+            quest.blocked_reason = ""
+            quest.retry_pending = True
+            save_quest(workspace, quest, session_id=session_id)
+            return quest
+        active.status = "failed"
+        active.note = verdict
+        quest.status = "blocked"
+        quest.blocked_reason = f"Verify: {verdict}"
+        save_quest(workspace, quest, session_id=session_id)
+        return quest
     if "PASS" in upper:
-        return set_step_status(workspace, active.id, "done", note=verdict)
+        return set_step_status(
+            workspace, active.id, "done", note=verdict, session_id=session_id
+        )
     return quest

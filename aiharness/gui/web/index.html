@@ -13,11 +13,17 @@
   <!-- ── sidebar ─────────────────────────────────────────────────────── -->
   <aside id="sidebar">
     <div class="brand">
-      <div class="brand-mark" id="pet" data-i18n-title="brand.pet" title="招财"><img id="pet-img" src="/static/pet/idle.gif" alt="招财"></div>
       <div class="brand-text">
         <div class="brand-name">Dr.Wang Agent</div>
-        <div class="brand-sub" id="workspace-label">—</div>
+        <div class="brand-sub" id="brand-slogan" data-i18n="brand.slogan" title="—">祝你活成你想要的样子</div>
       </div>
+      <div class="brand-mark" id="pet" data-i18n-title="brand.pet" title="招财"><img id="pet-img" src="/static/pet/idle.gif" alt="招财"></div>
+    </div>
+
+    <div class="mode-switch mode-switch-3" role="tablist" aria-label="Agent / Codex / Claude">
+      <button type="button" class="mode-switch-btn active" id="mode-agent" data-mode="agent" data-i18n="mode.agent">Agent</button>
+      <button type="button" class="mode-switch-btn" id="mode-codex" data-mode="codex" data-i18n="mode.codex">Codex</button>
+      <button type="button" class="mode-switch-btn" id="mode-claude" data-mode="claude" data-i18n="mode.claude">Claude</button>
     </div>
 
     <button class="primary-button" id="new-session" data-i18n="nav.newSession">＋ 新会话</button>
@@ -56,6 +62,7 @@
       </div>
     </header>
 
+    <div id="conn-banner" class="conn-banner hidden" role="status" aria-live="polite"></div>
     <section id="transcript" class="scroll-area"></section>
     <div id="activity-dock" class="activity-dock hidden" aria-live="polite"></div>
     <div id="prompt-queue" class="prompt-queue hidden"></div>
@@ -98,6 +105,146 @@
           <button class="ghost-button" id="heartbeat-button" data-i18n-title="composer.heartbeat" title="自动迭代">♥</button>
           <button class="ghost-button" id="interrupt" data-i18n-title="composer.interrupt" title="打断" disabled>■</button>
           <button class="primary-button" id="send" data-i18n="composer.send">发送</button>
+        </div>
+      </div>
+    </footer>
+  </main>
+
+  <!-- ── Codex main column (sibling runtime) ─────────────────────────── -->
+  <main id="codex-main" class="hidden">
+    <header id="codex-topbar">
+      <div class="topbar-left">
+        <span class="badge badge-codex" data-i18n="codex.badge">CODEX</span>
+        <span id="codex-status-text" class="stat">—</span>
+      </div>
+      <div class="topbar-right">
+        <select id="codex-profile-select" data-i18n-title="codex.profileTitle" title="Profile"></select>
+        <button type="button" class="ghost-button" id="codex-profile-edit" data-i18n="codex.profileEdit">档案</button>
+        <button type="button" class="ghost-button" id="codex-start" data-i18n="codex.start">连接</button>
+        <button type="button" class="ghost-button" id="codex-stop" data-i18n="codex.stop">断开</button>
+      </div>
+    </header>
+    <div id="codex-conn-banner" class="conn-banner hidden" role="status" aria-live="polite"></div>
+    <div id="codex-default-hint" class="conn-banner hidden" role="note"></div>
+    <div id="codex-profile-form" class="codex-profile-form hidden">
+      <div class="composer-toolbar">
+        <select id="codex-tpl-select"></select>
+        <input id="codex-pf-id" type="text" placeholder="id" data-i18n-placeholder="codex.pfId">
+        <input id="codex-pf-name" type="text" placeholder="名称" data-i18n-placeholder="codex.pfName">
+        <button type="button" class="ghost-button" id="codex-pf-new" data-i18n="codex.pfNew">新建档案</button>
+      </div>
+      <div class="composer-toolbar">
+        <input id="codex-pf-url" type="text" placeholder="base_url" data-i18n-placeholder="codex.pfUrl">
+        <input id="codex-pf-model" type="text" placeholder="model" data-i18n-placeholder="codex.pfModel">
+      </div>
+      <div class="composer-toolbar">
+        <input id="codex-pf-env" type="text" placeholder="ENV 或 API Key" data-i18n-placeholder="codex.pfKey">
+        <input id="codex-pf-proxy" type="text" list="proxy-presets"
+               data-i18n-placeholder="codex.pfProxy"
+               placeholder="网络出口：空=跟随系统 · direct=直连 · http://127.0.0.1:7897">
+        <button type="button" class="primary-button" id="codex-pf-save" data-i18n="codex.pfSave">保存并启用</button>
+        <button type="button" class="ghost-button" id="codex-pf-delete" data-i18n="codex.pfDelete">删除</button>
+      </div>
+      <div class="composer-toolbar panel-import-row">
+        <select id="codex-import-account" data-i18n-title="codex.importTitle" title="从 Agent 导入"></select>
+        <button type="button" class="ghost-button" id="codex-pf-import" data-i18n="codex.pfImport">从 Agent 导入</button>
+      </div>
+    </div>
+    <section id="codex-transcript" class="scroll-area"></section>
+    <div id="codex-activity-dock" class="activity-dock hidden" aria-live="polite"></div>
+    <footer id="codex-composer">
+      <div id="codex-workspace-chips" class="chips panel-workspace-chips"></div>
+      <div class="composer-shell">
+        <div class="composer-main">
+          <div id="codex-attach-strip" class="attach-strip hidden"></div>
+          <textarea id="codex-prompt" rows="4"
+                    data-i18n-placeholder="codex.placeholder"
+                    placeholder="向 Codex 说点什么…（Ctrl+Enter 发送 · 可粘贴/拖入图片）"></textarea>
+          <div class="composer-toolbar">
+            <select id="codex-model-select" data-i18n-title="codex.modelTitle" title="模型"></select>
+            <select id="codex-effort-select" data-i18n-title="composer.effort" title="推理强度"></select>
+            <select id="codex-mode-select" data-i18n-title="composer.mode" title="权限模式">
+              <option value="ask">ask · 每次确认</option>
+              <option value="auto">auto · 自动</option>
+              <option value="yolo">yolo · 不问</option>
+            </select>
+            <span id="codex-model-stat" class="stat">—</span>
+          </div>
+        </div>
+        <div class="composer-actions">
+          <button class="ghost-button" id="codex-screenshot" data-i18n-title="composer.screenshot" title="截屏">⊡</button>
+          <button class="ghost-button" id="codex-interrupt" data-i18n-title="composer.interrupt" title="打断" disabled>■</button>
+          <button class="primary-button" id="codex-send" data-i18n="composer.send">发送</button>
+        </div>
+      </div>
+    </footer>
+  </main>
+
+  <!-- ── Claude Code main column ─────────────────────────────────────── -->
+  <main id="claude-main" class="hidden">
+    <header id="claude-topbar">
+      <div class="topbar-left">
+        <span class="badge badge-claude" data-i18n="claude.badge">CLAUDE</span>
+        <span id="claude-status-text" class="stat">—</span>
+      </div>
+      <div class="topbar-right">
+        <select id="claude-profile-select" data-i18n-title="claude.profileTitle" title="Profile"></select>
+        <button type="button" class="ghost-button" id="claude-profile-edit" data-i18n="claude.profileEdit">档案</button>
+        <button type="button" class="ghost-button" id="claude-login" data-i18n="claude.login">登录</button>
+        <button type="button" class="ghost-button" id="claude-start" data-i18n="claude.start">连接</button>
+        <button type="button" class="ghost-button" id="claude-stop" data-i18n="claude.stop">断开</button>
+      </div>
+    </header>
+    <div id="claude-conn-banner" class="conn-banner hidden" role="status" aria-live="polite"></div>
+    <div id="claude-profile-form" class="codex-profile-form hidden">
+      <div class="composer-toolbar">
+        <select id="claude-tpl-select"></select>
+        <input id="claude-pf-id" type="text" placeholder="id" data-i18n-placeholder="codex.pfId">
+        <input id="claude-pf-name" type="text" placeholder="名称" data-i18n-placeholder="codex.pfName">
+        <button type="button" class="ghost-button" id="claude-pf-new" data-i18n="codex.pfNew">新建档案</button>
+      </div>
+      <div class="composer-toolbar">
+        <input id="claude-pf-url" type="text" placeholder="ANTHROPIC_BASE_URL（可选）" data-i18n-placeholder="claude.pfUrl">
+        <input id="claude-pf-model" type="text" placeholder="model（可选）" data-i18n-placeholder="claude.pfModel">
+      </div>
+      <div class="composer-toolbar">
+        <input id="claude-pf-env" type="text" placeholder="ENV 或 API Key" data-i18n-placeholder="codex.pfKey">
+        <input id="claude-pf-proxy" type="text" list="proxy-presets"
+               data-i18n-placeholder="codex.pfProxy"
+               placeholder="网络出口：空=跟随系统 · direct=直连 · http://127.0.0.1:7897">
+        <button type="button" class="primary-button" id="claude-pf-save" data-i18n="codex.pfSave">保存并启用</button>
+        <button type="button" class="ghost-button" id="claude-pf-delete" data-i18n="codex.pfDelete">删除</button>
+      </div>
+      <div class="composer-toolbar panel-import-row">
+        <select id="claude-import-account" data-i18n-title="codex.importTitle" title="从 Agent 导入"></select>
+        <button type="button" class="ghost-button" id="claude-pf-import" data-i18n="codex.pfImport">从 Agent 导入</button>
+      </div>
+    </div>
+    <section id="claude-transcript" class="scroll-area"></section>
+    <div id="claude-activity-dock" class="activity-dock hidden" aria-live="polite"></div>
+    <footer id="claude-composer">
+      <div id="claude-workspace-chips" class="chips panel-workspace-chips"></div>
+      <div class="composer-shell">
+        <div class="composer-main">
+          <div id="claude-attach-strip" class="attach-strip hidden"></div>
+          <textarea id="claude-prompt" rows="4"
+                    data-i18n-placeholder="claude.placeholder"
+                    placeholder="向 Claude Code 说点什么…（Ctrl+Enter 发送 · 可粘贴/拖入图片）"></textarea>
+          <div class="composer-toolbar">
+            <select id="claude-model-select" data-i18n-title="claude.modelTitle" title="模型"></select>
+            <select id="claude-effort-select" data-i18n-title="composer.effort" title="推理强度"></select>
+            <select id="claude-mode-select" data-i18n-title="composer.mode" title="权限模式">
+              <option value="ask">ask · 每次确认</option>
+              <option value="auto">auto · 自动</option>
+              <option value="yolo">yolo · 不问</option>
+            </select>
+            <span id="claude-model-stat" class="stat">—</span>
+          </div>
+        </div>
+        <div class="composer-actions">
+          <button class="ghost-button" id="claude-screenshot" data-i18n-title="composer.screenshot" title="截屏">⊡</button>
+          <button class="ghost-button" id="claude-interrupt" data-i18n-title="composer.interrupt" title="打断" disabled>■</button>
+          <button class="primary-button" id="claude-send" data-i18n="composer.send">发送</button>
         </div>
       </div>
     </footer>
@@ -408,6 +555,23 @@
       <canvas id="image-editor-canvas"></canvas>
       <textarea id="image-editor-text" class="image-editor-text hidden" rows="2"
                 placeholder="输入文字，Enter 确认 · Shift+Enter 换行 · Esc 取消"></textarea>
+    </div>
+  </div>
+</div>
+
+<!-- Read-only image lightbox for transcript / resource thumbs (PyWebView
+     cannot reliably window.open local attachment URLs). -->
+<div id="image-viewer" class="image-viewer hidden" aria-modal="true" role="dialog">
+  <div class="image-viewer-panel">
+    <div class="image-viewer-toolbar">
+      <span id="image-viewer-title" class="image-viewer-title"></span>
+      <div class="image-viewer-actions">
+        <button type="button" id="image-viewer-copy" data-i18n="viewer.copy">复制图片</button>
+        <button type="button" id="image-viewer-close" data-i18n="viewer.close">关闭</button>
+      </div>
+    </div>
+    <div class="image-viewer-stage" id="image-viewer-stage">
+      <img id="image-viewer-img" alt="">
     </div>
   </div>
 </div>

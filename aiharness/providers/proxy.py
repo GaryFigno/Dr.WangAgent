@@ -96,14 +96,54 @@ def client_kwargs(account: ProviderAccount) -> dict[str, Any]:
     return {"trust_env": False, "proxy": setting}
 
 
+def describe_setting(setting: str, chinese: bool = True) -> str:
+    """Human label for a raw proxy setting (account or CLI profile)."""
+    value = (setting or INHERIT).strip()
+    if not value:
+        return "跟随系统" if chinese else "system"
+    if value.lower() == DIRECT:
+        return "直连" if chinese else "direct"
+    return value
+
+
 def describe(account: ProviderAccount, chinese: bool = True) -> str:
     """A short human label for the account's routing, for the settings list."""
-    setting = (account.proxy or INHERIT).strip()
-    if not setting:
-        return "跟随系统" if chinese else "system"
-    if setting.lower() == DIRECT:
-        return "直连" if chinese else "direct"
-    return setting
+    return describe_setting(account.proxy or INHERIT, chinese=chinese)
+
+
+#: Env keys commonly consulted by CLIs / runtimes for outbound proxying.
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def apply_to_env(env: dict[str, str], setting: str) -> dict[str, str]:
+    """Apply a proxy choice onto a child-process environment dict.
+
+    Used by Codex / Claude Code profile launches: those CLIs read
+    ``HTTP_PROXY`` / ``HTTPS_PROXY`` from their process env, so each profile
+    can inherit the system proxy, force direct, or pin Clash Verge etc.
+    """
+    value = normalise(setting or INHERIT)
+    if not value:
+        return env
+    for key in _PROXY_ENV_KEYS:
+        env.pop(key, None)
+    if value.lower() == DIRECT:
+        # Some stacks still honour a leftover NO_PROXY; keep parent NO_PROXY.
+        return env
+    env["HTTP_PROXY"] = value
+    env["HTTPS_PROXY"] = value
+    env["ALL_PROXY"] = value
+    env["http_proxy"] = value
+    env["https_proxy"] = value
+    env["all_proxy"] = value
+    return env
 
 
 def explain_failure(account: ProviderAccount, error: Exception) -> str:

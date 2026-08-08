@@ -58,6 +58,8 @@ from .context import (
     compact,
     estimate_messages,
     measure_context,
+    microcompact_reads,
+    prepare_tool_result_for_model,
     prune_old_tool_outputs,
     truncate_tool_result,
 )
@@ -268,6 +270,7 @@ class Agent:
         self._doom_fp: str | None = None
         self._doom_count: int = 0
         self._overflow_retries_left: int = OVERFLOW_COMPACT_RETRIES
+        self._post_compact_reminder: bool = False
         self._last_model_overflow: bool = False
         #: Mid-stream prefetch of PARALLEL_SAFE tools, keyed by fingerprint.
         self._prefetch: dict[str, asyncio.Task[ToolResult]] = {}
@@ -424,7 +427,7 @@ class Agent:
           A notice string when images were saved but the model cannot see them,
           otherwise ``None``.
         """
-        note = build_environment_note(self.workspace)
+        note = build_environment_note(self.workspace, query=text)
         display = text.strip()
         refs: list[AttachmentRef] = []
         degrade_notice: str | None = None
@@ -632,6 +635,13 @@ class Agent:
                 yield Done(final_text, interrupted=True)
                 return
 
+            compacted_reads = microcompact_reads(self._messages)
+            if compacted_reads:
+                yield Notice(
+                    f"microcompacted {compacted_reads} older Read result(s)",
+                    level="info",
+                )
+
             if self.config.context.prune_tool_outputs:
                 pruned = prune_old_tool_outputs(self._messages)
                 if pruned:
@@ -648,7 +658,15 @@ class Agent:
             self._last_assistant = None
             self._last_model_overflow = False
             self._ephemeral_reminder = None
-            if turns > 1 and turns % REMINDER_EVERY_TURNS == 0:
+            if getattr(self, "_post_compact_reminder", False):
+                self._post_compact_reminder = False
+                self._ephemeral_reminder = (
+                    "<system-reminder>Context was compacted. You still have "
+                    "access to all tools in your system prompt. Continue from "
+                    "the handoff note and the recent messages.</system-reminder>"
+                )
+                yield Notice("post-compaction tool reminder injected", level="info")
+            elif turns > 1 and turns % REMINDER_EVERY_TURNS == 0:
                 self._ephemeral_reminder = self._build_session_reminder()
                 if self._ephemeral_reminder:
                     yield Notice("session reminder injected for this model call", level="info")
@@ -934,16 +952,41 @@ class Agent:
         return ToolResult.error(f"{call.name} returned an unexpected value")
 
     def _record(self, call: ToolCall, result: ToolResult) -> None:
-        content = truncate_tool_result(
+        """Persist a tool result: full text in meta, digest on the wire.
+
+        The GUI still receives the original :class:`ToolResult` via ToolEnd.
+        Main only sees ``content`` (and later prune digests).
+        """
+        full = truncate_tool_result(
             result.content, self.config.context.max_tool_result_chars
         )
+        args = self._safe_args(call)
+        command = str(args.get("command") or "") if call.name == "Bash" else ""
+        wire = prepare_tool_result_for_model(
+            call.name,
+            full,
+            is_error=result.is_error,
+            command=command,
+            context=self.config.context,
+        )
+        meta: dict[str, Any] = {"is_error": result.is_error, "tool": call.name}
+        if wire != full:
+            meta["full"] = full
+        if command:
+            meta["command"] = command[:240]
+        if call.name == "Read":
+            path = str(args.get("file_path") or "").strip()
+            if path:
+                meta["path"] = path[:480]
+            if result.display.get("cached"):
+                meta["cached_read"] = True
         self._append(
             Message(
                 role="tool",
-                content=content,
+                content=wire,
                 tool_call_id=call.id,
                 name=call.name,
-                meta={"is_error": result.is_error, "tool": call.name},
+                meta=meta,
             )
         )
 
@@ -1005,6 +1048,8 @@ class Agent:
                     tokens_after=after,
                 )
             )
+        # OpenCode: after compaction the model may "forget" tools — nudge once.
+        self._post_compact_reminder = True
         yield Compacted(
             summary=summary,
             tokens_before=before,

@@ -10,6 +10,7 @@ from aiharness.agent.planning import (
     Complexity,
     Plan,
     PlanStep,
+    build_classifier_context,
     classify_request,
     draft_plan,
     extract_json,
@@ -17,6 +18,7 @@ from aiharness.agent.planning import (
     parse_questions,
     score_to_complexity,
 )
+from aiharness.providers.base import Message, ToolCall
 from aiharness.agent.prompts import build_system_prompt
 from aiharness.permissions import Decision, PermissionEngine
 from aiharness.providers.router import Router, Selection
@@ -141,6 +143,58 @@ async def test_classification_reads_the_models_verdict(fake, config):
         assert verdict.complexity is Complexity.PROJECT
         assert verdict.needs_plan
         assert verdict.reason == "new subsystem"
+    finally:
+        await router.aclose()
+
+
+def test_classifier_context_keeps_recent_thread_and_strips_harness_noise():
+    """Follow-ups must see prior turns; clarifications/plan tags must not."""
+    messages = [
+        Message(role="user", content="注册商标要怎么做？", meta={"user_text": "注册商标要怎么做？"}),
+        Message(role="assistant", content="先确认商品分类，再填申请表。"),
+        Message(
+            role="user",
+            content="这里选哪个？",
+            meta={
+                "user_text": (
+                    "这里选哪个？\n\n<clarifications>\n- 分类体系: 商标注册\n"
+                    "</clarifications>\n\n[Plan mode is active. Writes are blocked.]"
+                )
+            },
+        ),
+        Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="1", name="Read", arguments="{}")],
+        ),
+    ]
+    ctx = build_classifier_context(messages)
+    assert "注册商标要怎么做" in ctx
+    assert "先确认商品分类" in ctx
+    assert "这里选哪个" in ctx
+    assert "clarifications" not in ctx
+    assert "Plan mode is active" not in ctx
+    assert "used tools: Read" in ctx
+
+
+async def test_classify_request_sends_conversation_context(fake, config):
+    fake.push(Reply(text=json.dumps({"score": 2, "reason": "续聊选类"})))
+    router = Router(config)
+    try:
+        await classify_request(
+            "还有微信表情包、AI短剧",
+            router,
+            Selection(model_id="fake"),
+            context="user: 我们主要是做游戏的、AI软件要选什么类？\nassistant: 游戏软件常见…",
+        )
+        sent = fake.requests[-1].body
+        body = sent["messages"][-1]["content"]
+        assert "Conversation so far" in body
+        assert "AI软件要选什么类" in body
+        assert "New request" in body
+        assert "微信表情包" in body
+        system = sent["messages"][0]["content"]
+        assert "ongoing thread" in system
     finally:
         await router.aclose()
 

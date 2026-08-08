@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from ..tools.fs import IGNORED_DIRS
+from .ignore import IgnoreMatcher
 
 #: Max matching lines returned to the GUI.
 SEARCH_HIT_LIMIT = 40
@@ -47,10 +47,11 @@ def search_content(
 
     hits: list[dict[str, Any]] = []
     scanned = 0
+    matcher = IgnoreMatcher.for_workspace(root)
     for path in root.rglob("*"):
         if scanned >= SEARCH_SCAN_FILE_LIMIT or len(hits) >= limit:
             break
-        if not path.is_file() or any(part in IGNORED_DIRS for part in path.parts):
+        if not path.is_file() or matcher.is_ignored(path):
             continue
         if suffix and not path.name.lower().endswith(suffix):
             continue

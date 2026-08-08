@@ -24,7 +24,7 @@ from ..agent.loop import (
     TurnEnd,
 )
 from ..agent.mesh import AgentMesh
-from ..agent.planning import classify_request
+from ..agent.planning import build_classifier_context, classify_request
 from ..config.schema import Config
 from ..constants import APP_NAME, UI_COMPLETION_LIMIT, UI_SCROLLBACK_LIMIT
 from ..mcp.manager import MCPManager
@@ -462,8 +462,12 @@ class HarnessApp(App[None]):
         if binding is None:
             return text
 
+        context = build_classifier_context(self.agent.messages)
         verdict = await classify_request(
-            text, self.router, Selection.from_binding(binding)
+            text,
+            self.router,
+            Selection.from_binding(binding),
+            context=context,
         )
         self._notice(
             f"{verdict.complexity.label_zh if self.chinese else verdict.complexity.value}"

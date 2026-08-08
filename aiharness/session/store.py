@@ -41,6 +41,7 @@ from ..providers.base import Message, ToolCall
 MESSAGES_FILE = "messages.jsonl"
 COMPACTIONS_FILE = "compactions.jsonl"
 META_FILE = "meta.json"
+TODOS_FILE = "todos.json"
 
 
 def sessions_root() -> Path:
@@ -257,7 +258,7 @@ class SessionHandle:
         self._messages: list[Message] = []
         self._compactions: list[CompactionRecord] = []
         self._loaded = False
-        #: In-memory TodoWrite list for this chat (not durable across restarts).
+        #: TodoWrite list for this chat (durable via ``todos.json``).
         self.todos: list[dict] = []
 
     # -- paths ------------------------------------------------------------
@@ -274,14 +275,43 @@ class SessionHandle:
     def meta_path(self) -> Path:
         return self.directory / META_FILE
 
+    @property
+    def todos_path(self) -> Path:
+        return self.directory / TODOS_FILE
+
     # -- loading ----------------------------------------------------------
 
     def load(self) -> SessionHandle:
         """Read the full record from disk. Idempotent."""
         self._messages = list(self._iter_messages())
         self._compactions = list(self._iter_compactions())
+        self.todos = self._read_todos()
         self._loaded = True
         return self
+
+    def _read_todos(self) -> list[dict]:
+        path = self.todos_path
+        if not path.is_file():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, dict) and item.get("content")]
+
+    def save_todos(self, todos: list[dict] | None = None) -> None:
+        """Persist the chat's TodoWrite list atomically."""
+        if todos is not None:
+            self.todos = list(todos)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = self.todos_path
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(self.todos, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp.replace(path)
 
     def _iter_messages(self) -> Iterator[Message]:
         if not self.messages_path.exists():
@@ -409,10 +439,15 @@ class SessionHandle:
         return removed
 
     def save_meta(self) -> None:
+        """Write meta atomically so a killed process cannot leave torn JSON."""
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.meta_path.write_text(
-            json.dumps(asdict(self.meta), ensure_ascii=False, indent=2), encoding="utf-8"
+        path = self.meta_path
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(asdict(self.meta), ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
+        tmp.replace(path)
 
     def set_model(self, model: str, account: str = "") -> None:
         self.meta.model = model

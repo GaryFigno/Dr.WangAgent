@@ -16,7 +16,7 @@ from typing import Any
 from ..agent.heartbeat import NO_LIMIT, HeartbeatLimits, StopReason
 from ..agent.loop import Compacted, Done, Notice, Text, Thinking, ToolEnd, ToolStart, TurnEnd
 from ..config.loader import save_config
-from ..constants import HEARTBEAT_DEFAULT_INTERVAL
+from ..constants import HEARTBEAT_DEFAULT_INTERVAL, QUEST_STEP_MAX_RETRIES
 from ..credentials import CredentialStore, classify
 from ..providers import proxy
 from ..providers.router import NoRouteError, Selection
@@ -34,6 +34,31 @@ from .protocol import Inbound, Outbound
 
 #: Permission modes the frontend may set.
 VALID_MODES = ("ask", "auto", "yolo")
+
+
+def open_todos_remaining(todos: list[dict] | None) -> list[dict]:
+    """TodoWrite items that are not completed."""
+    return [
+        item
+        for item in (todos or [])
+        if str(item.get("status") or "") != "completed"
+    ]
+
+
+def _todo_continue_prompt(todos: list[dict]) -> str:
+    lines = []
+    for item in open_todos_remaining(todos):
+        status = str(item.get("status") or "pending")
+        mark = ">" if status == "in_progress" else "-"
+        lines.append(f"{mark} [{status}] {item.get('content', '')}")
+    body = "\n".join(lines) or "(no open todos)"
+    return (
+        "[Continue unfinished work]\n"
+        "Open todos:\n"
+        f"{body}\n"
+        "Continue from the in-progress / next pending item. "
+        "Do not restart completed work. Update TodoWrite as you go."
+    )
 
 
 async def _persist_config(session: GuiSession) -> bool:
@@ -113,7 +138,7 @@ async def _prompt(session: GuiSession, args: dict[str, Any]) -> None:
     session.last_turn_refs = refs
     display_text = text
     ref_block, _ = build_refs_block(session.workspace, refs)
-    quest_hint = quest_prompt_hint(session.workspace)
+    quest_hint = quest_prompt_hint(session.workspace, session_id=view_id)
     wired = f"{quest_hint}{ref_block}{text}".strip()
     if not wired and images:
         wired = "(see attached images)"
@@ -227,22 +252,100 @@ async def run_turn(
         # Hard cancel can land between an assistant tool_calls message and
         # its tool results; seal before the next prompt hits the provider.
         agent.seal_unanswered_tool_calls()
-        await session.push(
-            Outbound.NOTICE,
-            level="warn",
-            text=session.msg("interrupted"),
-            session_id=turn_session_id,
-        )
+        # Soft interrupt already yields Done; hard cancel must still emit a
+        # terminal DONE so the UI does not stick on "正在打断…".
+        if not live.done_sent:
+            live.done_sent = True
+            await session.push(
+                Outbound.NOTICE,
+                level="warn",
+                text=session.msg("interrupted"),
+                session_id=turn_session_id,
+            )
+            await session.push(
+                Outbound.DONE,
+                text=final,
+                interrupted=True,
+                session_id=turn_session_id,
+            )
         raise
     finally:
         agent.seal_unanswered_tool_calls()
         session.live.pop(turn_session_id, None)
         if session.stream_session_id == turn_session_id:
             session.stream_session_id = None
-        await _drain_router_notices(session)
+        await _drain_router_notices(session, session_id=turn_session_id)
         await session.push_status()
         await session.push_sessions()
+        if turn_session_id not in session.live:
+            await _schedule_post_turn_continue(session, turn_session_id)
     return final
+
+
+async def _schedule_post_turn_continue(
+    session: GuiSession, session_id: str
+) -> None:
+    """Quest verify retry, optional auto-continue, or a resume notice."""
+    if session_id in session.live:
+        return
+    retry = session._quest_retry_after.pop(session_id, None)
+    if retry and session.session.meta.id == session_id:
+        session._turn_task = asyncio.create_task(
+            run_turn(session, retry, automatic=True)
+        )
+        return
+
+    todos = list(
+        session.session_todos.get(session_id)
+        or (
+            session.agent.ctx.todos
+            if session.session.meta.id == session_id
+            else None
+        )
+        or session.session.todos
+        or []
+    )
+    open_items = open_todos_remaining(todos)
+    if not open_items:
+        session._auto_continues.pop(session_id, None)
+        return
+
+    ui = session.config.ui
+    used = session._auto_continues.get(session_id, 0)
+    max_n = max(0, int(getattr(ui, "max_auto_continues", 3) or 0))
+    if (
+        ui.auto_continue_open_todos
+        and used < max_n
+        and session.session.meta.id == session_id
+        and not session._pending
+    ):
+        session._auto_continues[session_id] = used + 1
+        prompt = _todo_continue_prompt(todos)
+        await session.push(
+            Outbound.NOTICE,
+            level="info",
+            text=session.msg(
+                "todo.auto_continue", n=used + 1, max=max_n
+            ),
+            session_id=session_id,
+        )
+        session._turn_task = asyncio.create_task(
+            run_turn(
+                session,
+                prompt,
+                automatic=True,
+                display_text=f"[Auto-continue {used + 1}/{max_n}]",
+            )
+        )
+        return
+
+    if session.session.meta.id == session_id:
+        await session.push(
+            Outbound.NOTICE,
+            level="info",
+            text=session.msg("todo.resume_hint", n=len(open_items)),
+            session_id=session_id,
+        )
 
 
 def _transcript_images(session: GuiSession, images: list | None) -> list[dict]:
@@ -252,16 +355,22 @@ def _transcript_images(session: GuiSession, images: list | None) -> list[dict]:
     return [{"name": image.name, "mime": image.mime} for image in images]
 
 
-async def _drain_router_notices(session: GuiSession) -> None:
+async def _drain_router_notices(
+    session: GuiSession, *, session_id: str = ""
+) -> None:
     """Report workarounds the router applied on its own.
 
     Dropping a parameter an endpoint rejected rescues the turn, but doing it
     silently means the next person to read the config cannot tell why the
     model behaves differently than it is configured to.
     """
+    sid = session_id or session.stream_session_id or session.session.meta.id
     while session.router.notices:
         await session.push(
-            Outbound.NOTICE, level="warn", text=session.router.notices.pop(0)
+            Outbound.NOTICE,
+            level="warn",
+            text=session.router.notices.pop(0),
+            session_id=sid,
         )
 
 
@@ -334,24 +443,33 @@ async def _forward(
                 or []
             )
             handle = live.handle if live else session.session
-            handle.todos = list(todos)
+            handle.save_todos(todos)
             session.session_todos[sid] = list(todos)
+            if not open_todos_remaining(todos):
+                session._auto_continues.pop(sid, None)
             await session.push(Outbound.TODOS, todos=todos, session_id=sid)
             from ..quest import sync_quest_from_todos
 
-            quest = sync_quest_from_todos(session.workspace, todos)
+            quest = sync_quest_from_todos(
+                session.workspace, todos, session_id=sid
+            )
             if quest is not None:
-                await session.push(Outbound.QUEST, quest=quest.public())
+                await session.push(
+                    Outbound.QUEST, quest=quest.public(), session_id=sid
+                )
         if event.name == "Verify":
-            from ..quest import sync_quest_from_verify
+            from ..quest import quest_prompt_hint, sync_quest_from_verify
 
             quest = sync_quest_from_verify(
                 session.workspace,
                 verdict=str(display.get("verdict") or ""),
                 failures=int(display.get("failures") or 0),
+                session_id=sid,
             )
             if quest is not None:
-                await session.push(Outbound.QUEST, quest=quest.public())
+                await session.push(
+                    Outbound.QUEST, quest=quest.public(), session_id=sid
+                )
                 if quest.status == "blocked":
                     await _push(
                         Outbound.NOTICE,
@@ -361,10 +479,35 @@ async def _forward(
                             reason=quest.blocked_reason or "Verify",
                         ),
                     )
+                elif quest.retry_pending:
+                    step = next(
+                        (s for s in quest.steps if s.status == "active"), None
+                    )
+                    attempts = getattr(step, "attempts", 0) or 0
+                    title = step.title if step else quest.goal
+                    await _push(
+                        Outbound.NOTICE,
+                        level="info",
+                        text=session.msg(
+                            "quest.retrying",
+                            n=attempts,
+                            max=QUEST_STEP_MAX_RETRIES,
+                        ),
+                    )
+                    # Schedule after this turn's finally — mid-tool ``busy``
+                    # is always true, so starting another run_turn here never ran.
+                    prompt = (
+                        f"{quest_prompt_hint(session.workspace, session_id=sid)}"
+                        f"Continue the active Quest from step: {title}. "
+                        f"The last Verify failed; fix the root cause then "
+                        f"re-verify."
+                    )
+                    session._quest_retry_after[sid] = prompt.strip()
         if event.name == "Bash" and not event.result.is_error:
             n = int(display.get("side_effects") or 0)
-            if n and session.edit_review.pending():
-                await session.push_edit_review()
+            board = session.edit_board(sid)
+            if n and board.pending():
+                await session.push_edit_review(session_id=sid)
                 await _push(
                     Outbound.NOTICE,
                     level="info",
@@ -374,18 +517,19 @@ async def _forward(
             from ..workspace.paths import invalidate_path_index
 
             invalidate_path_index(session.workspace)
+            board = session.edit_board(sid)
             auto = (
                 session.permissions.mode == "yolo"
                 and session.config.ui.auto_apply_edits
             )
-            if auto and session.edit_review.pending():
-                session.edit_review.apply_all()
+            if auto and board.pending():
+                board.apply_all()
                 await _push(
                     Outbound.NOTICE,
                     level="info",
                     text=session.msg("yolo.auto_apply"),
                 )
-            await session.push_edit_review()
+            await session.push_edit_review(session_id=sid)
         path = str(display.get("path") or "")
         kind = str(display.get("kind") or "")
         if path and kind in {"write", "screenshot", "edit"} and _looks_canvas_path(path):
@@ -410,9 +554,22 @@ async def _forward(
         )
         await session.push_status()
     elif isinstance(event, Done):
+        live = session.live.get(sid)
+        if live is not None and live.done_sent:
+            return event.text
+        if live is not None:
+            live.done_sent = True
         if event.interrupted:
             await _push(
                 Outbound.NOTICE, level="warn", text=session.msg("interrupted")
+            )
+        elif not (event.text or "").strip():
+            # Tools-only / empty model replies used to clear the dock with no
+            # visible answer — look like the turn vanished mid-thought.
+            await _push(
+                Outbound.NOTICE,
+                level="warn",
+                text=session.msg("turn.empty"),
             )
         await _push(Outbound.DONE, text=event.text, interrupted=event.interrupted)
         return event.text
@@ -438,7 +595,7 @@ async def _route_by_complexity(
     session: GuiSession, text: str, *, agent: Any = None
 ) -> str:
     """Score the request and enter plan mode when it is a project."""
-    from ..agent.planning import classify_request
+    from ..agent.planning import build_classifier_context, classify_request
 
     owner = agent or session.agent
     sid = owner.session.meta.id if owner.session else session.session.meta.id
@@ -460,8 +617,13 @@ async def _route_by_complexity(
             )
         return text
 
+    # Score against the open thread — isolated prompts over-enter plan mode.
+    context = build_classifier_context(owner.messages)
     verdict = await classify_request(
-        text, session.router, Selection.from_binding(binding)
+        text,
+        session.router,
+        Selection.from_binding(binding),
+        context=context,
     )
     await session.push(
         Outbound.NOTICE,
@@ -522,16 +684,23 @@ async def _steer(session: GuiSession, args: dict[str, Any]) -> None:
 
 
 async def _interrupt(session: GuiSession, args: dict[str, Any]) -> None:
-    """Interrupt the viewed conversation’s in-flight turn (not every live one)."""
+    """Interrupt the viewed conversation’s in-flight turn (not every live one).
+
+    First click is a soft interrupt so the agent can yield ``Done`` cleanly.
+    A second click (or force) escalates to ``task.cancel()``.
+    """
     view_id = session.session.meta.id
     live = session.live.get(view_id)
     if live is None:
         await session.push(
-            Outbound.NOTICE, level="info", text=session.msg("interrupted")
+            Outbound.NOTICE, level="info", text=session.msg("interrupt.idle")
         )
         return
+    already = live.agent._cancel.is_set()
     live.agent.interrupt()
-    if live.task is not None:
+    force = bool(args.get("force"))
+    if (already or force) and live.task is not None and not live.task.done():
+        live.hard_cancel = True
         live.task.cancel()
     # Activity line only — a transcript notice stuck on "正在打断…" forever
     # looked like the interrupt never finished while tools kept running.
@@ -677,8 +846,6 @@ async def _open_session(session: GuiSession, args: dict[str, Any]) -> None:
             await session.push(Outbound.ERROR, message=str(error))
             return
         session.last_turn_refs = []
-    if live is None:
-        session.edit_review.clear()
     session.session = handle
     session.agent = agent if agent is not None else session._build_agent()
     session._wire_context()
@@ -722,6 +889,9 @@ async def _delete_session(session: GuiSession, args: dict[str, Any]) -> None:
         await session.push_sessions()
         return
     session.drafts.clear(target)
+    session.drop_edit_board(target)
+    session._quest_retry_after.pop(target, None)
+    session.session_todos.pop(target, None)
 
     if target != session.session.meta.id:
         await session.push_sessions()
@@ -1233,6 +1403,12 @@ async def _refresh(session: GuiSession, args: dict[str, Any]) -> None:
     from .workspace import RecentWorkspaces
 
     await session.push_all()
+    # Replaying the transcript mid-turn wipes the live streaming bubble
+    # (assistant text is not on disk until the model frame finishes). Skip
+    # while busy; reconnect uses on_client_attached → push_transcript instead.
+    force_transcript = bool(args.get("transcript") or args.get("force_transcript"))
+    if force_transcript or not session.busy:
+        await session.push_transcript()
     await session.push_context()
     await session.push_workspace(RecentWorkspaces.load().existing())
     await session.push_skills()
@@ -1255,6 +1431,13 @@ async def _pick_workspace(session: GuiSession, args: dict[str, Any]) -> None:
             text="没有可用的原生选择器，请直接填路径",
         )
         return
+    target = str(args.get("target") or "agent").strip().lower()
+    if target == "codex":
+        await _codex_set_workspace(session, {"path": chosen})
+        return
+    if target == "claude":
+        await _claude_set_workspace(session, {"path": chosen})
+        return
     await _set_workspace(session, {"path": chosen})
 
 
@@ -1276,9 +1459,8 @@ async def _set_workspace(session: GuiSession, args: dict[str, Any]) -> None:
 
     invalidate_path_index()
     session.last_turn_refs = []
-    # set_workspace registers the directory itself, in memory and on disk,
-    # so there is nothing to remember here — doing it in two places is how
-    # the two copies drifted apart before.
+    # Agent workspace is independent of Codex / Claude panel sessions.
+    # Panel cwd changes only via codex_set_workspace / claude_set_workspace.
     await session.push_workspace(session.live_workspaces())
     await session.push_transcript()
     await session.push_all()
@@ -2126,8 +2308,13 @@ async def _delete_memory(session: GuiSession, args: dict[str, Any]) -> None:
 async def _list_quest(session: GuiSession, args: dict[str, Any]) -> None:
     from ..quest import load_quest
 
-    quest = load_quest(session.workspace)
-    await session.push(Outbound.QUEST, quest=quest.public() if quest else None)
+    sid = session.session.meta.id
+    quest = load_quest(session.workspace, session_id=sid)
+    await session.push(
+        Outbound.QUEST,
+        quest=quest.public() if quest else None,
+        session_id=sid,
+    )
 
 
 async def _start_quest(session: GuiSession, args: dict[str, Any]) -> None:
@@ -2138,8 +2325,9 @@ async def _start_quest(session: GuiSession, args: dict[str, Any]) -> None:
     if not goal:
         await session.push(Outbound.ERROR, message="Quest 目标不能为空")
         return
-    quest = start_quest(session.workspace, goal, steps)
-    await session.push(Outbound.QUEST, quest=quest.public())
+    sid = session.session.meta.id
+    quest = start_quest(session.workspace, goal, steps, session_id=sid)
+    await session.push(Outbound.QUEST, quest=quest.public(), session_id=sid)
     await session.push(
         Outbound.NOTICE, level="info", text=session.msg("quest.started", goal=goal)
     )
@@ -2148,32 +2336,35 @@ async def _start_quest(session: GuiSession, args: dict[str, Any]) -> None:
 async def _quest_step(session: GuiSession, args: dict[str, Any]) -> None:
     from ..quest import set_step_status
 
+    sid = session.session.meta.id
     quest = set_step_status(
         session.workspace,
         str(args.get("id", "")),
         str(args.get("status", "done")),  # type: ignore[arg-type]
         note=str(args.get("note", "")),
         blocked_reason=str(args.get("blocked_reason", "")),
+        session_id=sid,
     )
     if quest is None:
         await session.push(Outbound.ERROR, message="没有这个 Quest 步骤")
         return
-    await session.push(Outbound.QUEST, quest=quest.public())
+    await session.push(Outbound.QUEST, quest=quest.public(), session_id=sid)
 
 
 async def _resume_quest(session: GuiSession, args: dict[str, Any]) -> None:
     from ..quest import quest_prompt_hint, resume_quest
 
-    quest = resume_quest(session.workspace)
+    sid = session.session.meta.id
+    quest = resume_quest(session.workspace, session_id=sid)
     if quest is None:
         await session.push(Outbound.ERROR, message=session.msg("quest.none"))
         return
-    await session.push(Outbound.QUEST, quest=quest.public())
+    await session.push(Outbound.QUEST, quest=quest.public(), session_id=sid)
     auto = args.get("auto", True)
     if auto and not session.busy:
         step = quest.active_step_title() or quest.goal
         prompt = (
-            f"{quest_prompt_hint(session.workspace)}"
+            f"{quest_prompt_hint(session.workspace, session_id=sid)}"
             f"Continue the active Quest from step: {step}. "
             f"Do not restart finished work. If the last failure was a Verify, "
             f"fix the root cause then re-verify."
@@ -2190,11 +2381,57 @@ async def _resume_quest(session: GuiSession, args: dict[str, Any]) -> None:
         )
 
 
+async def _continue_work(session: GuiSession, args: dict[str, Any]) -> None:
+    """One-click resume for open Quest steps or unfinished TodoWrite items."""
+    if session.busy:
+        await session.push(
+            Outbound.NOTICE, level="warn", text=session.msg("busy")
+        )
+        return
+    sid = session.session.meta.id
+    from ..quest import load_quest, quest_prompt_hint, resume_quest
+
+    quest = load_quest(session.workspace, session_id=sid)
+    if quest is not None and quest.status not in {"idle", "done"}:
+        await _resume_quest(session, {"auto": True})
+        return
+    todos = list(
+        session.session_todos.get(sid)
+        or session.agent.ctx.todos
+        or session.session.todos
+        or []
+    )
+    open_items = open_todos_remaining(todos)
+    if not open_items:
+        await session.push(
+            Outbound.NOTICE, level="info", text=session.msg("todo.nothing_open")
+        )
+        return
+    # Prefer resume_quest's path when a quest exists but was idle — otherwise
+    # seed from todos alone.
+    if quest is not None and quest.status == "blocked":
+        resume_quest(session.workspace, session_id=sid)
+    prompt = _todo_continue_prompt(todos)
+    await session.push(
+        Outbound.NOTICE,
+        level="info",
+        text=session.msg("todo.continuing", n=len(open_items)),
+    )
+    session._turn_task = asyncio.create_task(
+        run_turn(
+            session,
+            prompt,
+            display_text=session.msg("todo.continue_label", n=len(open_items)),
+        )
+    )
+
+
 async def _clear_quest(session: GuiSession, args: dict[str, Any]) -> None:
     from ..quest import save_quest
 
-    save_quest(session.workspace, None)
-    await session.push(Outbound.QUEST, quest=None)
+    sid = session.session.meta.id
+    save_quest(session.workspace, None, session_id=sid)
+    await session.push(Outbound.QUEST, quest=None, session_id=sid)
 
 
 async def _capture_screen(session: GuiSession, args: dict[str, Any]) -> None:
@@ -2287,6 +2524,266 @@ async def _save_canvas(session: GuiSession, args: dict[str, Any]) -> None:
     await session.push(Outbound.CANVAS_HINT, path=rel, kind="write")
 
 
+# --------------------------------------------------------------------------
+# Codex panel (sibling runtime)
+# --------------------------------------------------------------------------
+
+
+async def _codex_set_home(session: GuiSession, args: dict[str, Any]) -> None:
+    kind = str(
+        args.get("selection")
+        or args.get("profile_id")
+        or args.get("home_kind")
+        or args.get("kind")
+        or "kimi"
+    ).strip()
+    await session.codex.set_selection(kind)
+
+
+async def _codex_set_profile(session: GuiSession, args: dict[str, Any]) -> None:
+    await _codex_set_home(session, args)
+
+
+async def _codex_upsert_profile(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.codex.upsert_profile(args)
+
+
+async def _codex_delete_profile(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.codex.delete_profile(str(args.get("id") or args.get("profile_id") or ""))
+
+
+async def _codex_import_account(session: GuiSession, args: dict[str, Any]) -> None:
+    account_id = str(args.get("account_id") or args.get("id") or "").strip()
+    if not account_id:
+        raise ValueError("account_id is required")
+    await session.codex.import_account(
+        account_id,
+        activate=bool(args.get("activate", True)),
+    )
+
+
+async def _codex_start(session: GuiSession, args: dict[str, Any]) -> None:
+    kind = str(
+        args.get("selection") or args.get("profile_id") or args.get("home_kind") or ""
+    ).strip()
+    if kind:
+        await session.codex.set_selection(kind)
+    else:
+        await session.codex.start()
+
+
+async def _codex_stop(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.codex.stop()
+
+
+async def _codex_prompt(session: GuiSession, args: dict[str, Any]) -> None:
+    text = str(args.get("text", "")).strip()
+    images = args.get("images") or []
+    if not isinstance(images, list):
+        images = []
+    if not text and not images:
+        return
+    await session.codex.prompt(text, images=images)
+
+
+async def _codex_interrupt(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.codex.interrupt()
+
+
+async def _codex_approve(session: GuiSession, args: dict[str, Any]) -> None:
+    session.resolve(str(args.get("id", "")), args.get("decision"))
+
+
+async def _codex_set_model(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.codex.set_model(str(args.get("model") or args.get("id") or ""))
+
+
+async def _codex_set_effort(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.codex.set_effort(str(args.get("effort") or args.get("value") or ""))
+
+
+async def _codex_set_mode(session: GuiSession, args: dict[str, Any]) -> None:
+    mode = str(args.get("mode") or "").strip().lower()
+    if mode not in VALID_MODES:
+        await session.push(Outbound.ERROR, message=f"unknown mode '{mode}'")
+        return
+    await session.codex.set_permission_mode(mode)
+
+
+async def _codex_new_session(session: GuiSession, args: dict[str, Any]) -> None:
+    raw = str(args.get("path") or args.get("workspace") or "").strip()
+    workspace = Path(raw).expanduser().resolve() if raw else None
+    if workspace is not None and not workspace.is_dir():
+        await session.push(Outbound.ERROR, message=f"不是目录：{workspace}")
+        return
+    await session.codex.new_session(workspace)
+
+
+async def _codex_open_session(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.codex.open_session(str(args.get("id") or args.get("session_id") or ""))
+
+
+async def _codex_delete_session(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.codex.delete_session(str(args.get("id") or args.get("session_id") or ""))
+
+
+async def _codex_archive_session(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.codex.archive_session(
+        str(args.get("id") or args.get("session_id") or ""),
+        bool(args.get("archived", True)),
+    )
+
+
+async def _codex_set_workspace(session: GuiSession, args: dict[str, Any]) -> None:
+    raw = str(args.get("path") or args.get("workspace") or "").strip()
+    if not raw:
+        return
+    path = Path(raw).expanduser().resolve()
+    if not path.is_dir():
+        await session.push(Outbound.ERROR, message=f"不是目录：{path}")
+        return
+    await session.codex.set_panel_workspace(path)
+
+
+async def _codex_forget_workspace(session: GuiSession, args: dict[str, Any]) -> None:
+    raw = str(args.get("path") or "").strip()
+    if not raw:
+        return
+    await session.codex.forget_workspace(Path(raw))
+
+
+async def _codex_toggle_archived(session: GuiSession, args: dict[str, Any]) -> None:
+    show = bool(args.get("show", not session.codex.show_archived))
+    await session.codex.set_show_archived(show)
+
+
+async def _claude_set_profile(session: GuiSession, args: dict[str, Any]) -> None:
+    selection = str(args.get("selection") or args.get("profile_id") or args.get("id") or "").strip()
+    await session.claude.set_selection(selection)
+
+
+async def _claude_set_model(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.claude.set_model(str(args.get("model") or args.get("id") or ""))
+
+
+async def _claude_set_effort(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.claude.set_effort(str(args.get("effort") or args.get("value") or ""))
+
+
+async def _claude_set_mode(session: GuiSession, args: dict[str, Any]) -> None:
+    mode = str(args.get("mode") or "").strip().lower()
+    if mode not in VALID_MODES:
+        await session.push(Outbound.ERROR, message=f"unknown mode '{mode}'")
+        return
+    await session.claude.set_permission_mode(mode)
+
+
+async def _claude_upsert_profile(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.claude.upsert_profile(args)
+
+
+async def _claude_delete_profile(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.claude.delete_profile(str(args.get("id") or args.get("profile_id") or ""))
+
+
+async def _claude_import_account(session: GuiSession, args: dict[str, Any]) -> None:
+    account_id = str(args.get("account_id") or args.get("id") or "").strip()
+    if not account_id:
+        raise ValueError("account_id is required")
+    await session.claude.import_account(
+        account_id,
+        activate=bool(args.get("activate", True)),
+    )
+
+
+async def _claude_start(session: GuiSession, args: dict[str, Any]) -> None:
+    selection = str(args.get("selection") or args.get("profile_id") or "").strip()
+    if selection:
+        await session.claude.set_selection(selection)
+    else:
+        await session.claude.start()
+
+
+async def _claude_stop(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.claude.stop()
+
+
+async def _claude_prompt(session: GuiSession, args: dict[str, Any]) -> None:
+    text = str(args.get("text", "")).strip()
+    images = args.get("images") or []
+    if not isinstance(images, list):
+        images = []
+    if not text and not images:
+        return
+    await session.claude.prompt(text, images=images)
+
+
+async def _claude_interrupt(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.claude.interrupt()
+
+
+async def _claude_approve(session: GuiSession, args: dict[str, Any]) -> None:
+    session.resolve(str(args.get("id", "")), args.get("decision"))
+
+
+async def _claude_login(session: GuiSession, args: dict[str, Any]) -> None:
+    selection = str(args.get("selection") or args.get("profile_id") or "").strip()
+    if selection:
+        session.claude.selection = selection
+        try:
+            session.claude.profiles.set_active(selection)
+        except ValueError:
+            pass
+    await session.claude.login()
+
+
+async def _claude_new_session(session: GuiSession, args: dict[str, Any]) -> None:
+    raw = str(args.get("path") or args.get("workspace") or "").strip()
+    workspace = Path(raw).expanduser().resolve() if raw else None
+    if workspace is not None and not workspace.is_dir():
+        await session.push(Outbound.ERROR, message=f"不是目录：{workspace}")
+        return
+    await session.claude.new_session(workspace)
+
+
+async def _claude_open_session(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.claude.open_session(str(args.get("id") or args.get("session_id") or ""))
+
+
+async def _claude_delete_session(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.claude.delete_session(str(args.get("id") or args.get("session_id") or ""))
+
+
+async def _claude_archive_session(session: GuiSession, args: dict[str, Any]) -> None:
+    await session.claude.archive_session(
+        str(args.get("id") or args.get("session_id") or ""),
+        bool(args.get("archived", True)),
+    )
+
+
+async def _claude_set_workspace(session: GuiSession, args: dict[str, Any]) -> None:
+    raw = str(args.get("path") or args.get("workspace") or "").strip()
+    if not raw:
+        return
+    path = Path(raw).expanduser().resolve()
+    if not path.is_dir():
+        await session.push(Outbound.ERROR, message=f"不是目录：{path}")
+        return
+    await session.claude.set_panel_workspace(path)
+
+
+async def _claude_forget_workspace(session: GuiSession, args: dict[str, Any]) -> None:
+    raw = str(args.get("path") or "").strip()
+    if not raw:
+        return
+    await session.claude.forget_workspace(Path(raw))
+
+
+async def _claude_toggle_archived(session: GuiSession, args: dict[str, Any]) -> None:
+    show = bool(args.get("show", not session.claude.show_archived))
+    await session.claude.set_show_archived(show)
+
+
 HANDLERS: dict[Inbound, Any] = {
     Inbound.PROMPT: _prompt,
     Inbound.STEER: _steer,
@@ -2342,6 +2839,7 @@ HANDLERS: dict[Inbound, Any] = {
     Inbound.START_QUEST: _start_quest,
     Inbound.QUEST_STEP: _quest_step,
     Inbound.RESUME_QUEST: _resume_quest,
+    Inbound.CONTINUE_WORK: _continue_work,
     Inbound.CLEAR_QUEST: _clear_quest,
     Inbound.NEW_WINDOW: _new_window,
     Inbound.CAPTURE_SCREEN: _capture_screen,
@@ -2365,4 +2863,44 @@ HANDLERS: dict[Inbound, Any] = {
     Inbound.MARKET_ALERT_DELETE: _market_alert_delete,
     Inbound.PAPER_STATUS: _paper_status,
     Inbound.SEARCH_CONTENT: _search_content,
+    Inbound.CODEX_SET_HOME: _codex_set_home,
+    Inbound.CODEX_SET_PROFILE: _codex_set_profile,
+    Inbound.CODEX_UPSERT_PROFILE: _codex_upsert_profile,
+    Inbound.CODEX_DELETE_PROFILE: _codex_delete_profile,
+    Inbound.CODEX_IMPORT_ACCOUNT: _codex_import_account,
+    Inbound.CODEX_START: _codex_start,
+    Inbound.CODEX_STOP: _codex_stop,
+    Inbound.CODEX_PROMPT: _codex_prompt,
+    Inbound.CODEX_INTERRUPT: _codex_interrupt,
+    Inbound.CODEX_APPROVE: _codex_approve,
+    Inbound.CODEX_SET_MODEL: _codex_set_model,
+    Inbound.CODEX_SET_EFFORT: _codex_set_effort,
+    Inbound.CODEX_SET_MODE: _codex_set_mode,
+    Inbound.CODEX_NEW_SESSION: _codex_new_session,
+    Inbound.CODEX_OPEN_SESSION: _codex_open_session,
+    Inbound.CODEX_DELETE_SESSION: _codex_delete_session,
+    Inbound.CODEX_ARCHIVE_SESSION: _codex_archive_session,
+    Inbound.CODEX_SET_WORKSPACE: _codex_set_workspace,
+    Inbound.CODEX_FORGET_WORKSPACE: _codex_forget_workspace,
+    Inbound.CODEX_TOGGLE_ARCHIVED: _codex_toggle_archived,
+    Inbound.CLAUDE_SET_PROFILE: _claude_set_profile,
+    Inbound.CLAUDE_UPSERT_PROFILE: _claude_upsert_profile,
+    Inbound.CLAUDE_DELETE_PROFILE: _claude_delete_profile,
+    Inbound.CLAUDE_IMPORT_ACCOUNT: _claude_import_account,
+    Inbound.CLAUDE_START: _claude_start,
+    Inbound.CLAUDE_STOP: _claude_stop,
+    Inbound.CLAUDE_PROMPT: _claude_prompt,
+    Inbound.CLAUDE_INTERRUPT: _claude_interrupt,
+    Inbound.CLAUDE_APPROVE: _claude_approve,
+    Inbound.CLAUDE_SET_MODEL: _claude_set_model,
+    Inbound.CLAUDE_SET_EFFORT: _claude_set_effort,
+    Inbound.CLAUDE_SET_MODE: _claude_set_mode,
+    Inbound.CLAUDE_LOGIN: _claude_login,
+    Inbound.CLAUDE_NEW_SESSION: _claude_new_session,
+    Inbound.CLAUDE_OPEN_SESSION: _claude_open_session,
+    Inbound.CLAUDE_DELETE_SESSION: _claude_delete_session,
+    Inbound.CLAUDE_ARCHIVE_SESSION: _claude_archive_session,
+    Inbound.CLAUDE_SET_WORKSPACE: _claude_set_workspace,
+    Inbound.CLAUDE_FORGET_WORKSPACE: _claude_forget_workspace,
+    Inbound.CLAUDE_TOGGLE_ARCHIVED: _claude_toggle_archived,
 }

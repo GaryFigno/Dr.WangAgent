@@ -89,27 +89,12 @@ def _run(
         return
 
     if to_clipboard:
-        try:
-            copy_capture_to_clipboard(shot)
-        except CaptureError as error:
-            if tray is not None:
-                tray.notify("截屏失败", str(error))
-            return
-        if tray is not None:
-            tray.notify(
-                "截屏已复制",
-                f"{shot.width}×{shot.height} 已在剪贴板，可直接粘贴",
-            )
+        _deliver_clipboard_or_file(shot, tray, reason="主窗口未在前台")
         return
 
     loop = server_thread._loop
     if loop is None or not loop.is_running():
-        try:
-            copy_capture_to_clipboard(shot)
-            if tray is not None:
-                tray.notify("截屏已复制", "界面未连接，已写入剪贴板")
-        except CaptureError:
-            pass
+        _deliver_clipboard_or_file(shot, tray, reason="界面未连接")
         return
 
     future = asyncio.run_coroutine_threadsafe(
@@ -120,9 +105,35 @@ def _run(
     except Exception:  # noqa: BLE001
         delivered = False
     if not delivered:
+        _deliver_clipboard_or_file(shot, tray, reason="无打开的会话")
+
+
+def _deliver_clipboard_or_file(
+    shot,
+    tray: Tray | None,
+    *,
+    reason: str,
+) -> None:
+    """Clipboard first; if locked/busy, save a file so the shot is not lost."""
+    from .capture import CaptureError, copy_capture_to_clipboard, save_capture_fallback
+
+    try:
+        copy_capture_to_clipboard(shot)
+    except CaptureError as error:
         try:
-            copy_capture_to_clipboard(shot)
+            path = save_capture_fallback(shot)
+        except Exception:  # noqa: BLE001
             if tray is not None:
-                tray.notify("截屏已复制", "无打开的会话，已写入剪贴板")
-        except CaptureError:
-            pass
+                tray.notify("截屏失败", str(error))
+            return
+        if tray is not None:
+            tray.notify(
+                "截屏已保存",
+                f"剪贴板不可用（{error}），已存到 {path}",
+            )
+        return
+    if tray is not None:
+        tray.notify(
+            "截屏已复制",
+            f"{shot.width}×{shot.height} · {reason} · 已在剪贴板，可直接粘贴",
+        )

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+from aiharness.constants import QUEST_STEP_MAX_RETRIES
 from aiharness.edits import EditReviewBoard
 from aiharness.edits.diff import preview_for_kind, unified_hunk
 from aiharness.market.bars import Bar, BarSeries
@@ -79,7 +80,16 @@ def test_quest_sync_todos_and_verify_fail(tmp_path: Path):
     assert quest.steps[0].status == "done"
     assert quest.steps[1].status == "active"
 
-    sync_quest_from_verify(tmp_path, verdict="FAIL — tests red", failures=2)
+    retried = sync_quest_from_verify(tmp_path, verdict="FAIL — tests red", failures=2)
+    assert retried is not None
+    # First failure auto-retries instead of blocking. retry_pending is a
+    # transient flag on the return value, never persisted to quest.json.
+    assert retried.status == "active"
+    assert retried.retry_pending is True
+    assert retried.steps[1].attempts == 1
+
+    for _ in range(QUEST_STEP_MAX_RETRIES):
+        sync_quest_from_verify(tmp_path, verdict="FAIL — tests red", failures=2)
     blocked = load_quest(tmp_path)
     assert blocked is not None
     assert blocked.status == "blocked"

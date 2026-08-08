@@ -13,7 +13,7 @@ import asyncio
 import itertools
 import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -266,6 +266,8 @@ class Router:
         #: Recoveries worth telling the user about, drained by the UI. A
         #: silent workaround is indistinguishable from a bug on the next run.
         self.notices: list[str] = []
+        #: Optional UI hook fired before a same-account transport retry.
+        self.on_retry: Callable[[str], None] | None = None
         self._lock = asyncio.Lock()
 
     # -- plumbing ---------------------------------------------------------
@@ -450,6 +452,7 @@ class Router:
                             retryable=False,
                         )
                     if attempt + 1 < max_attempts_per_account:
+                        self._emit_retry(account.id, attempt + 2, "stream truncated")
                         await asyncio.sleep(_retry_backoff(attempt))
                         continue
                     break
@@ -464,6 +467,7 @@ class Router:
                         raise
                     # Prefer another account; if none remain, one same-account wait.
                     if attempt + 1 < max_attempts_per_account and len(accounts) == 1:
+                        self._emit_retry(account.id, attempt + 2, "rate limited")
                         await asyncio.sleep(min(backoff, RETRY_BACKOFF_CEILING))
                         continue
                     break
@@ -491,6 +495,7 @@ class Router:
                     if emitted or not error.retryable:
                         raise
                     if attempt + 1 < max_attempts_per_account:
+                        self._emit_retry(account.id, attempt + 2, "transport")
                         await asyncio.sleep(_retry_backoff(attempt))
                         continue
                     break
@@ -499,6 +504,17 @@ class Router:
 
         recent = "\n  ".join(errors[-ROUTE_ERROR_HISTORY:])
         raise NoRouteError(f"all accounts failed for model '{sel.model_id}':\n  {recent}")
+
+    def _emit_retry(self, account_id: str, attempt: int, reason: str) -> None:
+        """Surface a silent transport retry so the activity dock is not empty."""
+        if self.on_retry is None:
+            return
+        try:
+            self.on_retry(
+                f"网络不稳，正在重试 {account_id}（第 {attempt} 次 · {reason}）…"
+            )
+        except Exception:  # noqa: BLE001 — UI hook must never break failover
+            pass
 
     async def complete(
         self, sel: Selection, req: CompletionRequest, *, role: str = ""

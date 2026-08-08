@@ -54,13 +54,20 @@ COMPACT_TOOL_ARGS_CHARS: int = 800
 TRUNCATE_HEAD_FRACTION: float = 0.6
 TRUNCATE_TAIL_FRACTION: float = 0.3
 #: Keep roughly this many tokens of recent tool output when pruning history.
-PRUNE_PROTECT_TOKENS: int = 40_000
+#: Tightened so long verify/Bash turns digest sooner than a full 40k hangover.
+PRUNE_PROTECT_TOKENS: int = 20_000
 #: Only rewrite older tool outputs when reclaiming at least this many tokens.
-PRUNE_MINIMUM_TOKENS: int = 20_000
+PRUNE_MINIMUM_TOKENS: int = 8_000
 #: Do not prune tool results from the newest N user turns.
-PRUNE_KEEP_USER_TURNS: int = 2
+PRUNE_KEEP_USER_TURNS: int = 1
 #: Tool names whose outputs stay intact during prune (skills etc.).
 PRUNE_PROTECTED_TOOLS: frozenset[str] = frozenset({"Skill", "ListSkills"})
+#: Default caps for per-tool wire digests (overridable via ContextConfig).
+BASH_SUCCESS_RESULT_CHARS: int = 2_500
+BASH_ERROR_RESULT_CHARS: int = 6_000
+READ_RESULT_CHARS: int = 12_000
+#: Max characters kept for a prune-time one-line digest body.
+PRUNE_DIGEST_CHARS: int = 280
 #: Identical tool+args repeats before the harness refuses further invokes.
 DOOM_LOOP_THRESHOLD: int = 3
 #: After a context-overflow model error, compact once and retry this many times.
@@ -168,6 +175,8 @@ PROBE_TIMEOUT: float = 15.0
 
 #: Default ceiling on model turns in a single user request.
 DEFAULT_MAX_AGENT_TURNS: int = 100
+#: Default cap on automatic "continue open todos" chains per chat.
+DEFAULT_MAX_AUTO_CONTINUES: int = 3
 #: Default turn budget for a delegated subtask.
 DELEGATE_MAX_TURNS: int = 15
 #: Default turn budget for an explicitly spawned subagent.
@@ -388,6 +397,14 @@ MAX_MESSAGE_CHARS: int = 8000
 MAX_CHILD_SESSIONS: int = 6
 #: Seconds a blocking send waits for a reply before giving up.
 MESSAGE_REPLY_TIMEOUT: float = 300.0
+
+# --------------------------------------------------------------------------
+# Quest
+# --------------------------------------------------------------------------
+
+#: Automatic retries of the active step after a failed Verify, before the
+#: Quest is blocked and the user must resume by hand. Zero disables retries.
+QUEST_STEP_MAX_RETRIES: int = 2
 
 # --------------------------------------------------------------------------
 # Workflow learning

@@ -93,6 +93,39 @@ const state = {
   busy: false,
   status: null,
   config: null,
+  uiMode: "agent", // "agent" | "codex" | "claude"
+  codex: {
+    state: "stopped",
+    busy: false,
+    home_kind: "kimi",
+    selection: "kimi",
+    home_path: "",
+    model: "",
+    model_provider: "",
+    error: "",
+    profiles: [],
+    templates: [],
+  },
+  codexStreaming: null,
+  codexBuffer: "",
+  codexThinking: null,
+  codexTools: new Map(),
+  claude: {
+    state: "stopped",
+    busy: false,
+    error: "",
+    session_id: "",
+    selection: "anthropic",
+    profiles: [],
+    templates: [],
+    model: "",
+  },
+  claudeStreaming: null,
+  claudeBuffer: "",
+  claudeThinking: null,
+  claudeTools: new Map(),
+  codexAttachments: [],
+  claudeAttachments: [],
   streaming: null,   // the assistant bubble currently receiving deltas
   thinking: null,
   buffer: "",
@@ -127,6 +160,14 @@ const state = {
   //: Session the user intends to view (set on click before status arrives).
   //: Stream events from the previous chat must not paint during this gap.
   viewSessionId: "",
+  //: Codex / Claude panel viewed session ids (optimistic, for stream filter).
+  viewCodexSessionId: "",
+  viewClaudeSessionId: "",
+  codexReplayPending: false,
+  claudeReplayPending: false,
+  //: After open_session / new chat, the next transcript replay must land on
+  //: the latest message (ignore prior scroll position of the previous chat).
+  pinBottomOnReady: false,
   //: Ordered pending images for the next send (data URLs for thumbs).
   pendingImages: [],
   //: Prompts waiting while the open session is busy (editable guidance).
@@ -145,6 +186,13 @@ const state = {
   canvasDirty: false,
   //: Defer tool regroup until the turn finishes (less flicker).
   pendingToolFold: false,
+  //: True if the current turn streamed any visible assistant text.
+  turnHadText: false,
+  //: Prompt dropped while the local WebSocket was down; flushed on reconnect.
+  pendingPrompt: null,
+  //: True after the first successful socket open (so close is not a false alarm).
+  everConnected: false,
+  connBannerTimer: null,
 };
 
 const IMAGE_SUFFIX = /\.(png|jpe?g|webp|gif|bmp)$/i;
@@ -158,8 +206,17 @@ function connect() {
   state.socket = socket;
 
   socket.onopen = () => {
+    const wasDown = state.everConnected && !state.connected;
     state.connected = true;
+    state.everConnected = true;
+    if (wasDown) {
+      setConnBanner("ok", t("conn.restored"));
+      toast(t("conn.restored"), "ok");
+    } else {
+      setConnBanner(null);
+    }
     send("refresh", {});
+    flushPendingPrompt();
   };
   socket.onmessage = (event) => {
     let payload;
@@ -167,8 +224,16 @@ function connect() {
     catch { return; }
     handle(payload);
   };
+  socket.onerror = () => {
+    // onclose always follows; surface the failure before the timer reconnects.
+    if (state.everConnected) setConnBanner("error", t("conn.lost"));
+  };
   socket.onclose = () => {
     state.connected = false;
+    if (state.everConnected) {
+      setConnBanner("error", t("conn.retrying"));
+      toast(state.busy ? t("conn.turnKept") : t("conn.lost"), "warn");
+    }
     setTimeout(connect, RECONNECT_DELAY_MS);
   };
 }
@@ -176,6 +241,38 @@ function connect() {
 function send(type, payload) {
   if (state.socket && state.socket.readyState === WebSocket.OPEN) {
     state.socket.send(JSON.stringify({ type, ...payload }));
+    return true;
+  }
+  return false;
+}
+
+function setConnBanner(kind, text) {
+  const bar = $("conn-banner");
+  if (!bar) return;
+  if (state.connBannerTimer) {
+    clearTimeout(state.connBannerTimer);
+    state.connBannerTimer = null;
+  }
+  if (!kind) {
+    bar.className = "conn-banner hidden";
+    bar.textContent = "";
+    return;
+  }
+  bar.className = `conn-banner ${kind}`;
+  bar.textContent = text || "";
+  if (kind === "ok") {
+    state.connBannerTimer = setTimeout(() => setConnBanner(null), 2400);
+  }
+}
+
+function flushPendingPrompt() {
+  const pending = state.pendingPrompt;
+  if (!pending) return;
+  state.pendingPrompt = null;
+  setActivity(t("activity.sending"), "pending");
+  if (!send("prompt", pending)) {
+    state.pendingPrompt = pending;
+    setConnBanner("error", t("conn.retrying"));
   }
 }
 
@@ -185,7 +282,15 @@ function send(type, payload) {
 const SESSION_SCOPED = new Set([
   "text", "thinking", "turn_start", "turn_end", "done",
   "tool_start", "tool_end", "activity", "compacted", "notice",
-  "ask", "permission", "plan", "todos",
+  "ask", "permission", "plan", "todos", "quest", "edit_review",
+]);
+
+/** Codex / Claude stream events scoped by panel_session_id. */
+const PANEL_SESSION_SCOPED = new Set([
+  "codex_text", "codex_thinking", "codex_activity", "codex_tool_start",
+  "codex_tool_end", "codex_notice", "codex_permission", "codex_done", "codex_error",
+  "claude_text", "claude_thinking", "claude_activity", "claude_tool_start",
+  "claude_tool_end", "claude_notice", "claude_permission", "claude_done", "claude_error",
 ]);
 
 function forActiveSession(msg) {
@@ -198,6 +303,28 @@ function forActiveSession(msg) {
   return !id || msg.session_id === id;
 }
 
+function forActivePanelSession(msg) {
+  if (!msg || !PANEL_SESSION_SCOPED.has(msg.type)) return true;
+  const pid = msg.panel_session_id || "";
+  if (String(msg.type).startsWith("codex_")) {
+    const id = state.viewCodexSessionId
+      || (state.codex && (state.codex.viewed_id || state.codex.panel_session_id))
+      || "";
+    // Untagged stream events are dropped once a viewed session exists —
+    // otherwise an old singleton push could paint into the wrong chat.
+    if (!id) return true;
+    return !!pid && pid === id;
+  }
+  if (String(msg.type).startsWith("claude_")) {
+    const id = state.viewClaudeSessionId
+      || (state.claude && (state.claude.viewed_id || state.claude.panel_session_id))
+      || "";
+    if (!id) return true;
+    return !!pid && pid === id;
+  }
+  return true;
+}
+
 function handle(msg) {
   // Background Ask/Plan/Permission: remember + toast, do not open a global modal.
   if (msg && msg.session_id && ["ask", "permission", "plan"].includes(msg.type)
@@ -208,6 +335,7 @@ function handle(msg) {
     return;
   }
   if (!forActiveSession(msg)) return;
+  if (!forActivePanelSession(msg)) return;
   const handler = HANDLERS[msg.type];
   if (handler) handler(msg);
 }
@@ -217,10 +345,23 @@ const HANDLERS = {
     if (msg.protocol && msg.protocol !== PROTOCOL_VERSION) {
       toast(t("toast.protoMismatch", { remote: msg.protocol, local: PROTOCOL_VERSION }), "error");
     }
-    if (Array.isArray(msg.transcript)) replayTranscript(msg.transcript, msg.compactions || []);
+    // Empty transcript on every reconnect used to wipe the open chat.
+    // Only replay when the backend actually sent history (refresh / open).
+    // Never clobber an in-flight stream — that made answers vanish until restart.
+    // Session switches set pinBottomOnReady and abandon the previous stream view.
+    if (!Array.isArray(msg.transcript)) return;
+    const switchIn = state.pinBottomOnReady;
+    if (!switchIn && !msg.transcript.length) return;
+    if (!switchIn && (state.streaming || (state.busy && state.buffer))) {
+      return;
+    }
+    state.pinBottomOnReady = false;
+    replayTranscript(msg.transcript, msg.compactions || []);
+    scrollToLatest();
   },
 
   text(msg) {
+    if (msg.delta) state.turnHadText = true;
     setActivity(
       modelActivityLabel(
         t("activity.answering"),
@@ -253,6 +394,7 @@ const HANDLERS = {
     finishStreaming();
     setPet("thinking");
     state.turns += 1;
+    state.turnHadText = false;
     state.turnRefs = Array.isArray(msg.refs) ? msg.refs.slice() : [];
     renderTurnRefs(state.turnRefs);
     renderWorkspaceChips();
@@ -265,10 +407,15 @@ const HANDLERS = {
 
   done(msg) {
     finishStreaming();
+    // If deltas were dropped (refresh wipe / reconnect), still paint final text.
+    ensureAssistantVisible(msg.text);
     foldPendingTools();
     clearActivity();
-    setPet(msg.interrupted ? "error" : "happy");
-    if (msg.interrupted) toast(t("toast.interrupted"), "warn");
+    const interrupted = !!msg.interrupted;
+    const emptyText = !(msg.text || "").trim() && !state.turnHadText;
+    setPet(interrupted ? "error" : emptyText ? "error" : "happy");
+    if (interrupted) toast(t("toast.interrupted"), "warn");
+    else if (emptyText) toast(t("toast.emptyTurn"), "warn");
     // Status may flip busy→idle a tick later; queue flush also watches applyStatus.
     setTimeout(flushPromptQueue, 0);
   },
@@ -296,9 +443,20 @@ const HANDLERS = {
 
   notice(msg) {
     addNotice(msg.text, msg.level);
-    const text = String(msg.text || "");
-    if ((msg.level === "warn" || msg.level === "error") && /看图|图片|vision|image/i.test(text)) {
-      toast(text, msg.level === "error" ? "warn" : "warn");
+    const text = String(msg.text || "").trim();
+    if (!text) return;
+    // Provider / network failures must not hide in scrollback only.
+    if (msg.level === "error") {
+      toast(text, "error");
+      setActivity(text.length > 80 ? `${text.slice(0, 77)}…` : text, "error");
+      setPet("error");
+      return;
+    }
+    if (
+      msg.level === "warn"
+      && /看图|图片|vision|image|retry|重试|网络|timeout|timed out|可见文字|no visible answer|見える回答/i.test(text)
+    ) {
+      toast(text, "warn");
     }
   },
 
@@ -306,6 +464,10 @@ const HANDLERS = {
     state.capturingScreen = false;
     const btn = $("screenshot-button");
     if (btn) btn.disabled = false;
+    const codexBtn = $("codex-screenshot");
+    if (codexBtn) codexBtn.disabled = false;
+    const claudeBtn = $("claude-screenshot");
+    if (claudeBtn) claudeBtn.disabled = false;
     if (msg.cancelled) {
       toast(t("composer.screenshotCancel"), "ok");
       return;
@@ -314,7 +476,8 @@ const HANDLERS = {
       toast(t("composer.screenshotBusy"), "warn");
       return;
     }
-    if (state.pendingImages.length >= ATTACH_MAX_COUNT) {
+    const bucket = panelAttachBucket();
+    if (bucket.length >= ATTACH_MAX_COUNT) {
       toast(t("composer.screenshotFull"), "warn");
       return;
     }
@@ -324,18 +487,23 @@ const HANDLERS = {
       ? data
       : `data:${mime};base64,${data}`;
     const base64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : data;
-    state.pendingImages.push({
+    const item = {
       mime: mime === "image/jpg" ? "image/jpeg" : mime,
       name: msg.name || "screenshot.png",
       data: base64,
       dataUrl,
-    });
-    renderAttachStrip();
-    toast(t("composer.screenshotOk"), "ok");
-    // Capture always lands in the annotate editor; thumbs stay clickable too.
-    if (msg.open_editor !== false) {
-      openImageEditor(state.pendingImages.length - 1);
+      data_url: dataUrl,
+    };
+    bucket.push(item);
+    if (state.uiMode === "codex") renderPanelAttachStrip("codex");
+    else if (state.uiMode === "claude") renderPanelAttachStrip("claude");
+    else {
+      renderAttachStrip();
+      if (msg.open_editor !== false) {
+        openImageEditor(state.pendingImages.length - 1);
+      }
     }
+    toast(t("composer.screenshotOk"), "ok");
   },
 
   learn_result(msg) {
@@ -383,7 +551,11 @@ const HANDLERS = {
     }
   },
   context(msg) { renderContext(msg); },
-  sessions(msg) { renderSessions(msg); },
+  sessions(msg) {
+    // Agent session list must not overwrite Codex/Claude panel sidebars.
+    if (state.uiMode === "codex" || state.uiMode === "claude") return;
+    renderSessions(msg);
+  },
   config(msg) {
     if (msg.catalogue) { renderCatalogue(msg.catalogue); return; }
     if (msg.account_result) showAccountResult(msg.account_result);
@@ -395,7 +567,12 @@ const HANDLERS = {
     renderTodos(msg.todos || []);
   },
   edit_review(msg) {
-    state.pendingEdits = msg.pending || [];
+    const next = msg.pending || [];
+    // First pending item of a batch: expand so "待审改动 - 1" is not an empty bar.
+    if (next.length && !(state.pendingEdits && state.pendingEdits.length)) {
+      state.editReviewCollapsed = false;
+    }
+    state.pendingEdits = next;
     renderEditReview(state.pendingEdits);
     renderEditDiffPanel(state.pendingEdits);
   },
@@ -403,6 +580,68 @@ const HANDLERS = {
   permission(msg) { showPermissionInline(msg); },
   ask(msg) { showQuestionsInline(msg); },
   plan(msg) { showPlanInline(msg); },
+
+  codex_status(msg) { applyCodexStatus(msg); },
+  codex_text(msg) { appendCodexText(msg.delta || ""); },
+  codex_thinking(msg) { appendPanelThinking("codex", msg.delta || ""); },
+  codex_activity(msg) { setPanelActivity("codex", msg.text || "", msg.kind || "busy"); },
+  codex_tool_start(msg) {
+    setPanelActivity("codex", msg.headline || msg.name || "tool", "busy");
+    addPanelToolEntry("codex", msg);
+  },
+  codex_tool_end(msg) { completePanelToolEntry("codex", msg); },
+  codex_notice(msg) {
+    if (msg.text) {
+      addCodexEntry("notice", msg.text);
+      toast(msg.text, msg.level === "error" ? "error" : (msg.level || "ok"));
+    }
+  },
+  codex_permission(msg) { showCodexPermissionInline(msg); },
+  codex_done(msg) {
+    finishCodexStream();
+    clearPanelActivity("codex");
+    state.codex.busy = false;
+    applyCodexStatus({ ...state.codex, busy: false });
+  },
+  codex_error(msg) {
+    finishCodexStream();
+    clearPanelActivity("codex");
+    if (msg.message) {
+      addCodexEntry("notice", msg.message);
+      toast(msg.message, "error");
+    }
+  },
+
+  claude_status(msg) { applyClaudeStatus(msg); },
+  claude_text(msg) { appendClaudeText(msg.delta || ""); },
+  claude_thinking(msg) { appendPanelThinking("claude", msg.delta || ""); },
+  claude_activity(msg) { setPanelActivity("claude", msg.text || "", msg.kind || "busy"); },
+  claude_tool_start(msg) {
+    setPanelActivity("claude", msg.headline || msg.name || "tool", "busy");
+    addPanelToolEntry("claude", msg);
+  },
+  claude_tool_end(msg) { completePanelToolEntry("claude", msg); },
+  claude_notice(msg) {
+    if (msg.text) {
+      addClaudeEntry("notice", msg.text);
+      toast(msg.text, msg.level === "error" ? "error" : (msg.level || "ok"));
+    }
+  },
+  claude_permission(msg) { showClaudePermissionInline(msg); },
+  claude_done(msg) {
+    finishClaudeStream();
+    clearPanelActivity("claude");
+    state.claude.busy = false;
+    applyClaudeStatus({ ...state.claude, busy: false });
+  },
+  claude_error(msg) {
+    finishClaudeStream();
+    clearPanelActivity("claude");
+    if (msg.message) {
+      addClaudeEntry("notice", msg.message);
+      toast(msg.message, "error");
+    }
+  },
 
   heartbeat(msg) {
     $("heartbeat-badge").classList.toggle("hidden", !msg.active);
@@ -433,6 +672,55 @@ const HANDLERS = {
 function renderWorkspace(msg) {
   state.workspace = msg;
   renderWorkspaceChips();
+  renderPanelWorkspaceChips("codex");
+  renderPanelWorkspaceChips("claude");
+}
+
+function shortWorkspaceLabel(path) {
+  if (!path) return "—";
+  const parts = String(path).split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 2) return path;
+  return parts.slice(-2).join("\\");
+}
+
+/* Codex / Claude: workspace chips live above the composer (same place as Agent). */
+function renderPanelWorkspaceChips(kind) {
+  const row = $(`${kind}-workspace-chips`);
+  if (!row) return;
+  const status = kind === "codex" ? state.codex : state.claude;
+  const current = (status && status.workspace) || "";
+  const groups = (status && status.sessions && status.sessions.workspaces) || [];
+  const recents = (state.workspace && state.workspace.recents) || [];
+  const paths = [current, ...groups.map((g) => g.path), ...recents].filter(Boolean);
+  row.innerHTML = "";
+  row.classList.remove("hidden");
+  row.appendChild(el("span", "chips-label", t("panel.workspace") || "工作目录"));
+  const labels = disambiguate(paths);
+  const seen = new Set();
+  for (const path of paths) {
+    if (seen.has(path)) continue;
+    seen.add(path);
+    const chip = el(
+      "button",
+      `chip${path === current ? " chip-active" : ""}`,
+      labels.get(path) || shortWorkspaceLabel(path),
+    );
+    chip.title = path;
+    chip.onclick = () => send(`${kind}_set_workspace`, { path });
+    row.appendChild(chip);
+  }
+  const add = el("button", "chip chip-add", "＋");
+  add.title = t("panel.workspacePick") || "选择…";
+  add.onclick = () => chooseWorkspace(kind);
+  row.appendChild(add);
+}
+
+function syncPanelModeSelect(kind) {
+  const select = $(`${kind}-mode-select`);
+  if (!select) return;
+  const status = kind === "codex" ? state.codex : state.claude;
+  const mode = (status && status.permission_mode) || "ask";
+  if (["ask", "auto", "yolo"].includes(mode)) select.value = mode;
 }
 
 /* The chip row above the composer, shown only while the conversation is
@@ -496,7 +784,21 @@ function disambiguate(paths) {
 /* The native folder dialog only exists when a desktop window is hosting the
  * page. In browser mode there is nothing to open, so offer a typed path and
  * a list of recents instead. */
-function chooseWorkspace() {
+function chooseWorkspace(target) {
+  // onclick handlers pass a MouseEvent as the first arg — only accept explicit mode strings.
+  const mode = (target === "codex" || target === "claude" || target === "agent")
+    ? target
+    : (state.uiMode === "codex" || state.uiMode === "claude" ? state.uiMode : "agent");
+  const setCmd = mode === "codex"
+    ? "codex_set_workspace"
+    : mode === "claude"
+      ? "claude_set_workspace"
+      : "set_workspace";
+  const current = mode === "codex"
+    ? (state.codex && state.codex.workspace)
+    : mode === "claude"
+      ? (state.claude && state.claude.workspace)
+      : (state.workspace && state.workspace.path);
   const recents = (state.workspace && state.workspace.recents) || [];
   openModal("选择工作目录", (body) => {
     body.appendChild(el("div", "hint",
@@ -504,14 +806,17 @@ function chooseWorkspace() {
 
     const browse = el("button", "primary-button", "浏览文件夹…");
     browse.style.cssText = "width:100%;margin:12px 0;";
-    browse.onclick = () => { closeModal(); send("pick_workspace", {}); };
+    browse.onclick = () => {
+      closeModal();
+      send("pick_workspace", { target: mode });
+    };
     body.appendChild(browse);
 
     if (recents.length) {
       body.appendChild(el("div", "section-label", "最近使用"));
       for (const path of recents) {
         const item = el("div", "catalogue-item", path);
-        item.onclick = () => { closeModal(); send("set_workspace", { path }); };
+        item.onclick = () => { closeModal(); send(setCmd, { path }); };
         body.appendChild(item);
       }
     }
@@ -519,23 +824,25 @@ function chooseWorkspace() {
     body.appendChild(el("div", "section-label", "或直接填路径"));
     const input = el("input");
     input.placeholder = "C:\\path\\to\\project";
-    input.value = (state.workspace && state.workspace.path) || "";
+    input.value = current || "";
     input.style.cssText =
       "width:100%;background:var(--panel);color:var(--text);border:1px solid " +
       "var(--line);border-radius:6px;padding:10px;outline:none;";
     input.onkeydown = (event) => {
       if (event.key === "Enter" && input.value.trim()) {
         closeModal();
-        send("set_workspace", { path: input.value.trim() });
+        send(setCmd, { path: input.value.trim() });
       }
     };
     body.appendChild(input);
     state.workspaceInput = input;
+    state.workspaceSetCmd = setCmd;
   }, [
     { label: "取消", run: () => {} },
     { label: "使用这个路径", primary: true, run: () => {
         const value = state.workspaceInput && state.workspaceInput.value.trim();
-        if (value) send("set_workspace", { path: value });
+        const cmd = state.workspaceSetCmd || "set_workspace";
+        if (value) send(cmd, { path: value });
       } },
   ]);
 }
@@ -587,11 +894,36 @@ function atBottom() {
   return node.scrollHeight - node.scrollTop - node.clientHeight < SCROLL_STICK_PX;
 }
 
+function scrollToLatest() {
+  const node = transcript();
+  if (!node) return;
+  node.scrollTop = node.scrollHeight;
+  // Images / markdown can grow layout after paint — stick again next frames.
+  requestAnimationFrame(() => {
+    node.scrollTop = node.scrollHeight;
+    requestAnimationFrame(() => {
+      node.scrollTop = node.scrollHeight;
+    });
+  });
+}
+
 function mount(node, options) {
   const stick = options && options.stick === false ? false : atBottom();
   transcript().appendChild(node);
   if (stick) transcript().scrollTop = transcript().scrollHeight;
   return node;
+}
+
+/** Drop in-view stream handles when leaving a chat (DOM is about to rebuild). */
+function abandonLiveStreamView() {
+  if (state.streamFrame) {
+    cancelAnimationFrame(state.streamFrame);
+    state.streamFrame = 0;
+  }
+  state.streaming = null;
+  state.buffer = "";
+  state.thinking = null;
+  state.turnHadText = false;
 }
 
 function authUrl(path) {
@@ -607,16 +939,93 @@ function addUser(text, images, userIndex) {
   const gallery = el("div", "user-images");
   for (const image of images || []) {
     const img = document.createElement("img");
-    img.src = authUrl(image.url || image.dataUrl || "");
+    const src = authUrl(image.url || image.dataUrl || "");
+    img.src = src;
     img.alt = image.name || "image";
-    img.title = image.name || "";
-    img.onclick = () => window.open(img.src, "_blank");
+    img.title = image.name || t("viewer.openHint");
+    img.onclick = (event) => {
+      event.stopPropagation();
+      openImageViewer(src, image.name || "");
+    };
     gallery.appendChild(img);
   }
   node.appendChild(gallery);
   if (text) node.appendChild(el("div", "user-text", text));
   attachBubbleActions(node, text, userIndex);
   mount(node);
+}
+
+function openImageViewer(src, title) {
+  const root = $("image-viewer");
+  const img = $("image-viewer-img");
+  const label = $("image-viewer-title");
+  if (!root || !img) return;
+  img.src = src || "";
+  img.alt = title || "";
+  if (label) label.textContent = title || t("viewer.title");
+  root.classList.remove("hidden");
+}
+
+function closeImageViewer() {
+  const root = $("image-viewer");
+  const img = $("image-viewer-img");
+  if (root) root.classList.add("hidden");
+  if (img) img.removeAttribute("src");
+}
+
+async function copyImageFromUrl(src) {
+  if (!src) {
+    toast(t("copyFail"), "warn");
+    return;
+  }
+  try {
+    const response = await fetch(src);
+    const blob = await response.blob();
+    const type = blob.type && blob.type.startsWith("image/")
+      ? blob.type
+      : "image/png";
+    if (navigator.clipboard && window.ClipboardItem) {
+      await navigator.clipboard.write([
+        new ClipboardItem({ [type]: blob }),
+      ]);
+      toast(t("viewer.copied"), "ok");
+      return;
+    }
+    // Fallback: open data URL is useless in WebView; copy as text link.
+    await navigator.clipboard.writeText(src);
+    toast(t("viewer.copiedLink"), "ok");
+  } catch {
+    toast(t("copyFail"), "warn");
+  }
+}
+
+function wireImageViewer() {
+  const root = $("image-viewer");
+  if (!root || root.dataset.wired) return;
+  root.dataset.wired = "1";
+  const closeBtn = $("image-viewer-close");
+  const copyBtn = $("image-viewer-copy");
+  const stage = $("image-viewer-stage");
+  if (closeBtn) closeBtn.onclick = () => closeImageViewer();
+  if (copyBtn) {
+    copyBtn.onclick = () => {
+      const img = $("image-viewer-img");
+      copyImageFromUrl(img && img.src);
+    };
+  }
+  if (stage) {
+    stage.onclick = (event) => {
+      if (event.target === stage) closeImageViewer();
+    };
+  }
+  root.addEventListener("click", (event) => {
+    if (event.target === root) closeImageViewer();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && root && !root.classList.contains("hidden")) {
+      closeImageViewer();
+    }
+  });
 }
 
 function attachBubbleActions(node, text, userIndex) {
@@ -1181,7 +1590,8 @@ function clearActivity(source) {
 
 function appendText(delta) {
   if (!state.streaming) {
-    state.buffer = "";
+    // Do not wipe buffer — a mid-turn transcript refresh may have dropped
+    // the streaming node while deltas already lived in state.buffer.
     state.streaming = mount(el("div", "entry assistant"));
   }
   state.buffer += delta;
@@ -1282,6 +1692,15 @@ function finishStreaming() {
     attachPinMemory(state.streaming, text);
     state.streaming = null;
     state.buffer = "";
+  } else if ((state.buffer || "").trim()) {
+    // streaming node was wiped (transcript refresh) but deltas remain in buffer.
+    const text = state.buffer;
+    state.buffer = "";
+    const node = mount(el("div", "entry assistant"));
+    node.innerHTML = renderMarkdown(text);
+    decorateCopyables(node);
+    attachPinMemory(node, text);
+    state.turnHadText = true;
   }
   if (state.thinking) {
     const body = state.thinking.querySelector(".thinking-body");
@@ -1301,6 +1720,44 @@ function finishStreaming() {
 
 function addNotice(text, level) {
   mount(el("div", `entry notice ${level || "info"}`, text));
+}
+
+/** Guarantee the final answer is on screen even if stream bubbles were lost. */
+function ensureAssistantVisible(text) {
+  const body = String(text || "").trim();
+  if (!body) return;
+  const host = transcript();
+  if (!host) return;
+  let last = host.lastElementChild;
+  // Skip trailing notices / activity hosts / edit chrome.
+  while (
+    last
+    && (
+      last.classList.contains("notice")
+      || last.classList.contains("activity-host")
+      || last.classList.contains("thinking")
+    )
+  ) {
+    last = last.previousElementSibling;
+  }
+  if (last && last.classList.contains("assistant")) {
+    const existing = (last.textContent || "").trim();
+    if (existing.length >= Math.min(40, body.length)) {
+      state.turnHadText = true;
+      return;
+    }
+    last.innerHTML = renderMarkdown(body);
+    decorateCopyables(last);
+    attachPinMemory(last, body);
+    state.turnHadText = true;
+    return;
+  }
+  const node = mount(el("div", "entry assistant"));
+  node.innerHTML = renderMarkdown(body);
+  decorateCopyables(node);
+  attachPinMemory(node, body);
+  state.turnHadText = true;
+  if (atBottom()) host.scrollTop = host.scrollHeight;
 }
 
 function workspaceFileUrl(path) {
@@ -1353,7 +1810,11 @@ function resourceChip(path, kind) {
   chip.appendChild(el("span", "resource-label", shortPathLabel(path)));
   chip.onclick = (event) => {
     event.stopPropagation();
-    send("open_path", { path, mode: isImage ? "open" : "reveal" });
+    if (isImage) {
+      openImageViewer(workspaceFileUrl(path), shortPathLabel(path));
+      return;
+    }
+    send("open_path", { path, mode: "reveal" });
   };
   chip.oncontextmenu = (event) => {
     event.preventDefault();
@@ -1562,12 +2023,17 @@ function addCompaction(msg) {
 }
 
 function replayTranscript(entries, compactions) {
-  transcript().innerHTML = "";
+  const host = transcript();
+  host.innerHTML = "";
+  // Reset scroll before rebuild so mount()'s sticky check starts from top=0
+  // of an empty pane (otherwise the previous chat's offset can stick mid-way).
+  host.scrollTop = 0;
   state.tools.clear();
   state.resources.clear();
   renderResourceStrip();
   state.activity = null;
   state.streaming = null;
+  state.buffer = "";
   state.thinking = null;
   clearInlineHitl();
   state.turns = entries.length;
@@ -1585,6 +2051,7 @@ function replayTranscript(entries, compactions) {
     addCompaction({ summary: record.summary, before: record.before,
                     after: record.after, replaced: record.replaced });
   }
+  scrollToLatest();
 }
 
 /* ── status ────────────────────────────────────────────────────────── */
@@ -1604,6 +2071,8 @@ function applyStatus(status) {
   // changes, otherwise "k3@Kimi 思考中" leaks onto a DeepSeek session.
   if (sessionChanged) {
     clearActivity();
+    abandonLiveStreamView();
+    state.pinBottomOnReady = true;
     if (status.busy) {
       const line = (status.activity || "").trim()
         || modelActivityLabel(t("activity.busy"), status.model, status.account);
@@ -1617,9 +2086,22 @@ function applyStatus(status) {
       || modelActivityLabel(t("activity.busy"), status.model, status.account);
     setActivity(line, "busy");
   }
+  // Cancel paths may clear busy via status without a DONE frame — still
+  // fold sticky streaming / open tool cards the same way done() does.
+  if (wasBusy && !status.busy) {
+    finishStreaming();
+    foldPendingTools();
+    clearActivity();
+    // Do NOT refresh+replay transcript here. push_transcript only has
+    // user/assistant text — replaying wipes every live tool card and makes
+    // a finished turn look empty. Missed answer text is handled by done().
+  } else if (sessionChanged) {
+    send("refresh", { transcript: true });
+  } else if (!wasBusy && status.busy) {
+    // Sidebar "运行中" only — do not replay transcript mid-stream.
+    send("refresh", {});
+  }
   applyComposerDraft(status);
-  // Refresh sidebar badges when a background turn starts/stops while hidden.
-  if (wasBusy !== status.busy || sessionChanged) send("refresh", {});
 
   // Keep Send enabled while busy so the user can queue the next guidance.
   $("send").disabled = false;
@@ -1664,8 +2146,8 @@ function applyStatus(status) {
   cache.classList.toggle("warn", runHit < 0.3 && runHit > 0);
 
   $("mode-select").value = status.mode;
-  $("workspace-label").textContent = status.workspace_name || "—";
-  $("workspace-label").title = status.workspace || "";
+  // The slogan line is static (i18n); keep the workspace path as a tooltip.
+  $("brand-slogan").title = status.workspace || "";
   syncModelControls(status);
   if (status.language != null) {
     syncLanguageSelect(status.language);
@@ -1810,6 +2292,42 @@ function flushDraftNow() {
 /* Sessions are grouped by project. A conversation only makes sense against
  * the tree it ran in, so a flat list across every directory would be a lie
  * about what these things are. */
+function panelSessionPrefix() {
+  if (state.uiMode === "codex") return "codex";
+  if (state.uiMode === "claude") return "claude";
+  return "";
+}
+
+function clearPanelTranscriptDom(mode) {
+  const host = panelTranscript(mode);
+  if (host) host.innerHTML = "";
+  if (mode === "codex") {
+    state.codexStreaming = null;
+    state.codexBuffer = "";
+    state.codexThinking = null;
+    state.codexTools = new Map();
+  } else if (mode === "claude") {
+    state.claudeStreaming = null;
+    state.claudeBuffer = "";
+    state.claudeThinking = null;
+    state.claudeTools = new Map();
+  }
+}
+
+function replayPanelTranscript(mode, rows) {
+  clearPanelTranscriptDom(mode);
+  const host = panelTranscript(mode);
+  if (!host || !Array.isArray(rows)) return;
+  for (const row of rows) {
+    const role = row.role || "assistant";
+    const text = row.text || "";
+    if (!text) continue;
+    if (mode === "codex") addCodexEntry(role === "user" ? "user" : "assistant", text);
+    else addClaudeEntry(role === "user" ? "user" : "assistant", text);
+  }
+  host.scrollTop = host.scrollHeight;
+}
+
 function renderSessions(msg) {
   const list = $("session-list");
   list.innerHTML = "";
@@ -1827,6 +2345,7 @@ function renderSessions(msg) {
     return;
   }
 
+  const prefix = panelSessionPrefix();
   for (const group of msg.workspaces || []) {
     const block = el("div", "ws-group");
     const head = el("div", `ws-head${group.active ? " active" : ""}`);
@@ -1843,8 +2362,9 @@ function renderSessions(msg) {
       const detail = count
         ? `会连同它下面的 ${count} 个会话一起删除，磁盘上的文件不动。`
         : "它下面没有会话，只是从列表里移除。";
+      const cmd = prefix ? `${prefix}_forget_workspace` : "forget_workspace";
       askConfirm("移除项目", `${group.path}\n\n${detail}`, () =>
-        send("forget_workspace", { path: group.path }));
+        send(cmd, { path: group.path }));
     };
     head.appendChild(forget);
 
@@ -1852,6 +2372,8 @@ function renderSessions(msg) {
     head.onclick = () => {
       if (group.active) {
         toggleCollapsed(group.path);
+      } else if (prefix) {
+        send(`${prefix}_set_workspace`, { path: group.path });
       } else {
         send("set_workspace", { path: group.path });
       }
@@ -1879,7 +2401,13 @@ function renderSessions(msg) {
 function toggleCollapsed(path) {
   if (state.collapsed.has(path)) state.collapsed.delete(path);
   else state.collapsed.add(path);
-  send("refresh", {});
+  if (state.uiMode === "codex" && state.codex.sessions) {
+    renderSessions(state.codex.sessions);
+  } else if (state.uiMode === "claude" && state.claude.sessions) {
+    renderSessions(state.claude.sessions);
+  } else {
+    send("refresh", {});
+  }
 }
 
 function sessionRow(meta, group) {
@@ -1887,21 +2415,24 @@ function sessionRow(meta, group) {
   const waiting = !!meta.waiting;
   const item = el("div",
     `session-item${meta.active ? " active" : ""}${meta.archived ? " archived" : ""}${running ? " running" : ""}${waiting ? " waiting" : ""}`);
+  const prefix = panelSessionPrefix();
 
   const actions = el("span", "session-actions");
   const archive = el("span", "act", meta.archived ? "↩" : "⌂");
   archive.title = meta.archived ? "取消归档" : "归档（不删除，只是收起来）";
   archive.onclick = (event) => {
     event.stopPropagation();
-    send("archive_session", { id: meta.id, archived: !meta.archived });
+    const cmd = prefix ? `${prefix}_archive_session` : "archive_session";
+    send(cmd, { id: meta.id, archived: !meta.archived });
   };
   const remove = el("span", "act danger", "✕");
   remove.title = "删除这个会话";
   remove.onclick = (event) => {
     event.stopPropagation();
+    const cmd = prefix ? `${prefix}_delete_session` : "delete_session";
     askConfirm(`删除会话「${meta.title}」？`,
       "这会连同它的完整记录一起删除，不可撤销。归档可以只是收起来。",
-      () => send("delete_session", { id: meta.id }));
+      () => send(cmd, { id: meta.id }));
   };
   actions.append(archive, remove);
 
@@ -1910,18 +2441,43 @@ function sessionRow(meta, group) {
   if (waiting) title.appendChild(el("span", "session-waiting", t("session.waiting")));
   else if (running) title.appendChild(el("span", "session-running", t("session.running")));
   item.append(title, el("div", "session-meta",
-    `${meta.updated} · ${meta.messages} 条 · $${(meta.cost || 0).toFixed(4)}`));
+    `${meta.updated} · ${meta.messages} 条`));
   item.onclick = () => {
-    flushDraftNow();
     const id = meta.id;
+    if (prefix === "codex") {
+      if (id && id !== state.viewCodexSessionId) {
+        state.viewCodexSessionId = id;
+        state.codexReplayPending = true;
+        clearPanelTranscriptDom("codex");
+        clearPanelActivity("codex");
+      }
+      send("codex_open_session", { id });
+      return;
+    }
+    if (prefix === "claude") {
+      if (id && id !== state.viewClaudeSessionId) {
+        state.viewClaudeSessionId = id;
+        state.claudeReplayPending = true;
+        clearPanelTranscriptDom("claude");
+        clearPanelActivity("claude");
+      }
+      send("claude_open_session", { id });
+      return;
+    }
+    flushDraftNow();
     if (id && id !== state.viewSessionId) {
       // Retarget stream filter + sticky dock immediately — do not wait for
       // status, or the previous chat's "思考中" keeps blinking on this one.
       state.viewSessionId = id;
       clearActivity();
+      abandonLiveStreamView();
+      state.pinBottomOnReady = true;
       if (meta.running) {
         setActivity(t("session.running") + "…", "busy");
       }
+    } else {
+      // Same session: still jump to the latest message.
+      scrollToLatest();
     }
     // Backend opens across projects atomically; a live turn keeps running.
     send("open_session", { id });
@@ -2668,6 +3224,14 @@ function renderTodos(todos) {
   summary.type = "button";
   summary.onclick = () => toggle.click();
   head.append(toggle, summary);
+  const openCount = state.lastTodos.filter((item) => item.status !== "completed").length;
+  if (openCount && !(state.status && state.status.busy)) {
+    const cont = el("button", "ghost-button", t("todo.continue"));
+    cont.type = "button";
+    cont.title = t("todo.continueTitle");
+    cont.onclick = () => send("continue_work", {});
+    head.appendChild(cont);
+  }
   strip.appendChild(head);
   if (collapsed) return;
 
@@ -3554,7 +4118,7 @@ function dispatchPrompt(text, images, refs, shown) {
     clearTimeout(state.draftTimer);
     state.draftTimer = null;
   }
-  send("prompt", {
+  const payload = {
     text,
     refs,
     images: images.map((item) => ({
@@ -3562,7 +4126,15 @@ function dispatchPrompt(text, images, refs, shown) {
       name: item.name,
       data: item.data,
     })),
-  });
+  };
+  if (!send("prompt", payload)) {
+    // Local UI↔backend socket is down (not the model API). Keep the bubble
+    // and resend automatically when the socket comes back.
+    state.pendingPrompt = payload;
+    setConnBanner("error", t("conn.retrying"));
+    setActivity(t("conn.waitingSend"), "pending");
+    toast(t("conn.offlineSend"), "warn");
+  }
 }
 
 function submitPrompt() {
@@ -3590,13 +4162,17 @@ function submitPrompt() {
 
 function requestScreenshot() {
   if (state.capturingScreen) return;
-  if (state.pendingImages.length >= ATTACH_MAX_COUNT) {
+  if (panelAttachBucket().length >= ATTACH_MAX_COUNT) {
     toast(t("composer.screenshotFull"), "warn");
     return;
   }
   state.capturingScreen = true;
   const btn = $("screenshot-button");
   if (btn) btn.disabled = true;
+  const codexBtn = $("codex-screenshot");
+  if (codexBtn) codexBtn.disabled = true;
+  const claudeBtn = $("claude-screenshot");
+  if (claudeBtn) claudeBtn.disabled = true;
   toast(t("composer.screenshotBusy"), "ok");
   send("capture_screen", { hide_self: true, interactive: true });
   // Region select can take a while; keep the button locked until reply / timeout.
@@ -3607,8 +4183,1151 @@ function requestScreenshot() {
   }, 120000);
 }
 
+function setUiMode(mode) {
+  state.uiMode = (mode === "codex" || mode === "claude") ? mode : "agent";
+  const app = $("app");
+  if (app) {
+    app.classList.toggle("mode-codex", state.uiMode === "codex");
+    app.classList.toggle("mode-claude", state.uiMode === "claude");
+    app.classList.toggle("mode-agent", state.uiMode === "agent");
+  }
+  const agentMain = $("main");
+  const codexMain = $("codex-main");
+  const claudeMain = $("claude-main");
+  if (agentMain) agentMain.classList.toggle("hidden", state.uiMode !== "agent");
+  if (codexMain) codexMain.classList.toggle("hidden", state.uiMode !== "codex");
+  if (claudeMain) claudeMain.classList.toggle("hidden", state.uiMode !== "claude");
+  const agentBtn = $("mode-agent");
+  const codexBtn = $("mode-codex");
+  const claudeBtn = $("mode-claude");
+  if (agentBtn) agentBtn.classList.toggle("active", state.uiMode === "agent");
+  if (codexBtn) codexBtn.classList.toggle("active", state.uiMode === "codex");
+  if (claudeBtn) claudeBtn.classList.toggle("active", state.uiMode === "claude");
+  if (state.uiMode === "codex") {
+    applyCodexStatus(state.codex);
+    if (state.codex.sessions) renderSessions(state.codex.sessions);
+    const box = $("codex-prompt");
+    if (box) box.focus();
+  } else if (state.uiMode === "claude") {
+    applyClaudeStatus(state.claude);
+    if (state.claude.sessions) renderSessions(state.claude.sessions);
+    const box = $("claude-prompt");
+    if (box) box.focus();
+  } else {
+    send("refresh", { transcript: false });
+  }
+}
+
+function renderCodexProfileSelect() {
+  const select = $("codex-profile-select");
+  if (!select) return;
+  const profiles = state.codex.profiles || [];
+  const current = state.codex.selection || state.codex.profile_id || "default";
+  const options = [`<option value="default">${escapeHtml(t("codex.homeDefault"))}</option>`];
+  for (const p of profiles) {
+    const bits = [];
+    if (p.has_secret) bits.push("key");
+    else if (p.env_key) bits.push(`$${p.env_key}`);
+    if (p.proxy_label && p.proxy_label !== "跟随系统" && p.proxy_label !== "system") {
+      bits.push(p.proxy_label);
+    } else if (p.proxy === "direct") {
+      bits.push("直连");
+    }
+    const mark = bits.length ? ` · ${bits.join(" · ")}` : "";
+    options.push(
+      `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}${escapeHtml(mark)}</option>`
+    );
+  }
+  select.innerHTML = options.join("");
+  select.value = current === "default" ? "default" : current;
+  if (select.value !== current && current !== "default") {
+    // Fall back if profile missing.
+    if (profiles.length) select.value = profiles[0].id;
+  }
+  const tpl = $("codex-tpl-select");
+  if (tpl) {
+    const templates = state.codex.templates || [];
+    const prev = tpl.value;
+    tpl.innerHTML = templates.map((item) =>
+      `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name || item.id)}</option>`
+    ).join("") || '<option value="custom">Custom</option>';
+    if (prev) tpl.value = prev;
+  }
+  renderCodexModelSelect();
+  renderImportAccountSelect("codex");
+  const hint = $("codex-default-hint");
+  if (hint) {
+    const isDefault = (state.codex.selection || state.codex.home_kind) === "default";
+    if (isDefault) {
+      hint.className = "conn-banner";
+      hint.textContent = t("codex.defaultHint");
+    } else {
+      hint.className = "conn-banner hidden";
+      hint.textContent = "";
+    }
+  }
+}
+
+function renderImportAccountSelect(panel) {
+  const select = $(panel === "claude" ? "claude-import-account" : "codex-import-account");
+  if (!select) return;
+  const source = panel === "claude" ? state.claude : state.codex;
+  const accounts = (source && source.agent_accounts) || [];
+  const prev = select.value;
+  if (!accounts.length) {
+    select.innerHTML = `<option value="">${escapeHtml(t("codex.importEmpty"))}</option>`;
+    select.disabled = true;
+    return;
+  }
+  select.disabled = false;
+  select.innerHTML = accounts.map((account) => {
+    const mark = account.has_key ? " · key" : "";
+    const label = `${account.id}${account.note ? ` · ${account.note}` : ""}${mark}`;
+    return `<option value="${escapeHtml(account.id)}">${escapeHtml(label)}</option>`;
+  }).join("");
+  if (prev && accounts.some((item) => item.id === prev)) select.value = prev;
+}
+
+function renderCodexModelSelect() {
+  const select = $("codex-model-select");
+  if (!select) return;
+  const models = state.codex.models || [];
+  const current = state.codex.selected_model || state.codex.model || "";
+  if (!models.length) {
+    select.innerHTML = `<option value="">${escapeHtml(current || t("codex.modelPick"))}</option>`;
+    if (current) {
+      select.innerHTML = `<option value="${escapeHtml(current)}">${escapeHtml(current)}</option>`;
+      select.value = current;
+    }
+    select.disabled = !current;
+    renderCodexEffortSelect();
+    return;
+  }
+  const seen = new Set();
+  const options = [];
+  for (const m of models) {
+    const id = m.id || m.model || "";
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    options.push(
+      `<option value="${escapeHtml(id)}">${escapeHtml(m.label || id)}</option>`
+    );
+  }
+  if (current && !seen.has(current)) {
+    options.unshift(`<option value="${escapeHtml(current)}">${escapeHtml(current)}</option>`);
+  }
+  select.innerHTML = options.join("") || `<option value="">${escapeHtml(t("codex.modelPick"))}</option>`;
+  select.disabled = false;
+  if (current) select.value = current;
+  renderCodexEffortSelect();
+}
+
+function renderCodexEffortSelect() {
+  const select = $("codex-effort-select");
+  if (!select) return;
+  const levels = state.codex.effort_levels || [];
+  const current = state.codex.selected_effort || "";
+  if (!levels.length) {
+    select.innerHTML = `<option value="">${escapeHtml(t("composer.effort") || "effort")}</option>`;
+    select.disabled = true;
+    return;
+  }
+  select.innerHTML = levels.map((level) =>
+    `<option value="${escapeHtml(level)}">effort: ${escapeHtml(level)}</option>`
+  ).join("");
+  select.disabled = state.codex.busy || levels.length <= 1;
+  if (current && levels.includes(current)) select.value = current;
+  else select.value = levels[levels.length - 1] || "";
+}
+
+function applyCodexStatus(msg) {
+  if (!msg) return;
+  const prevView = state.viewCodexSessionId;
+  state.codex = { ...state.codex, ...msg };
+  if (state.codex.viewed_id || state.codex.panel_session_id) {
+    state.viewCodexSessionId = state.codex.viewed_id || state.codex.panel_session_id;
+  }
+  const label = t(`codex.state.${state.codex.state || "stopped"}`) || state.codex.state || "—";
+  const statusText = $("codex-status-text");
+  if (statusText) {
+    const sel = state.codex.selection || state.codex.home_kind || "—";
+    statusText.textContent = state.codex.error
+      ? `${label} · ${state.codex.error}`
+      : `${label} · ${sel}`;
+  }
+  renderCodexProfileSelect();
+  renderPanelWorkspaceChips("codex");
+  syncPanelModeSelect("codex");
+  const modelStat = $("codex-model-stat");
+  if (modelStat) {
+    const model = state.codex.selected_model || state.codex.model;
+    const effort = state.codex.selected_effort;
+    const parts = [state.codex.model_provider, model, effort].filter(Boolean);
+    modelStat.textContent = parts.length ? parts.join(" · ") : "—";
+  }
+  const modelSelect = $("codex-model-select");
+  if (modelSelect) modelSelect.disabled = !!state.codex.busy;
+  renderCodexEffortSelect();
+  const interrupt = $("codex-interrupt");
+  if (interrupt) interrupt.disabled = !state.codex.busy;
+  const sendBtn = $("codex-send");
+  if (sendBtn) sendBtn.disabled = state.codex.state === "starting";
+  const banner = $("codex-conn-banner");
+  if (banner) {
+    if (state.codex.state === "error" && state.codex.error) {
+      banner.className = "conn-banner error";
+      banner.textContent = state.codex.error;
+    } else if (state.codex.state === "starting") {
+      banner.className = "conn-banner";
+      banner.textContent = t("codex.state.starting");
+    } else {
+      banner.className = "conn-banner hidden";
+      banner.textContent = "";
+    }
+  }
+  if (state.codex.sessions && state.uiMode === "codex") {
+    renderSessions(state.codex.sessions);
+  }
+  const nextView = state.viewCodexSessionId;
+  if (
+    Array.isArray(msg.transcript)
+    && nextView
+    && (nextView !== prevView || state.codexReplayPending)
+  ) {
+    state.codexReplayPending = false;
+    replayPanelTranscript("codex", msg.transcript);
+  }
+}
+
+function renderClaudeModelSelect() {
+  const select = $("claude-model-select");
+  if (!select) return;
+  const models = state.claude.models || [];
+  const current = state.claude.selected_model || state.claude.model || "";
+  if (!models.length) {
+    select.innerHTML = `<option value="">${escapeHtml(current || t("claude.modelPick"))}</option>`;
+    if (current) {
+      select.innerHTML = `<option value="${escapeHtml(current)}">${escapeHtml(current)}</option>`;
+      select.value = current;
+    }
+    select.disabled = !current;
+    renderClaudeEffortSelect();
+    return;
+  }
+  const seen = new Set();
+  const options = [];
+  for (const m of models) {
+    const id = m.id || m.model || "";
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    options.push(
+      `<option value="${escapeHtml(id)}">${escapeHtml(m.label || id)}</option>`
+    );
+  }
+  if (current && !seen.has(current)) {
+    options.unshift(`<option value="${escapeHtml(current)}">${escapeHtml(current)}</option>`);
+  }
+  select.innerHTML = options.join("") || `<option value="">${escapeHtml(t("claude.modelPick"))}</option>`;
+  select.disabled = !!state.claude.busy;
+  if (current) select.value = current;
+  renderClaudeEffortSelect();
+}
+
+function renderClaudeEffortSelect() {
+  const select = $("claude-effort-select");
+  if (!select) return;
+  const levels = state.claude.effort_levels || [];
+  const current = state.claude.selected_effort || "";
+  if (!levels.length) {
+    select.innerHTML = `<option value="">${escapeHtml(t("composer.effort") || "effort")}</option>`;
+    select.disabled = true;
+    return;
+  }
+  select.innerHTML = levels.map((level) =>
+    `<option value="${escapeHtml(level)}">effort: ${escapeHtml(level)}</option>`
+  ).join("");
+  select.disabled = state.claude.busy || levels.length <= 1;
+  if (current && levels.includes(current)) select.value = current;
+  else select.value = levels[levels.length - 1] || "";
+}
+
+function applyClaudeStatus(msg) {
+  if (!msg) return;
+  const prevView = state.viewClaudeSessionId;
+  const wasBusy = !!(state.claude && state.claude.busy);
+  state.claude = { ...state.claude, ...msg };
+  if (state.claude.viewed_id || state.claude.panel_session_id) {
+    state.viewClaudeSessionId = state.claude.viewed_id || state.claude.panel_session_id;
+  }
+  // Drop a stuck "系统: status" pulse when the runtime reports idle.
+  if (wasBusy && !state.claude.busy) clearPanelActivity("claude");
+  else if (!state.claude.busy) {
+    const dock = $("claude-activity-dock");
+    const row = dock && dock.querySelector(".activity");
+    if (row && /^系统[：:]/i.test(row.textContent || "")) clearPanelActivity("claude");
+  }
+  const label = t(`claude.state.${state.claude.state || "stopped"}`) || state.claude.state || "—";
+  const statusText = $("claude-status-text");
+  if (statusText) {
+    const sel = state.claude.selection || state.claude.profile_id || "—";
+    statusText.textContent = state.claude.error
+      ? `${label} · ${state.claude.error}`
+      : `${label} · ${sel}`;
+  }
+  renderClaudeProfileSelect();
+  renderPanelWorkspaceChips("claude");
+  syncPanelModeSelect("claude");
+  const modelStat = $("claude-model-stat");
+  if (modelStat) {
+    const model = state.claude.selected_model || state.claude.model;
+    const effort = state.claude.selected_effort;
+    const parts = [
+      state.claude.auth_mode === "login" ? "login" : "api",
+      model,
+      effort,
+    ].filter(Boolean);
+    modelStat.textContent = parts.length ? parts.join(" · ") : "—";
+  }
+  const modelSelect = $("claude-model-select");
+  if (modelSelect) modelSelect.disabled = !!state.claude.busy;
+  renderClaudeModelSelect();
+  const interrupt = $("claude-interrupt");
+  if (interrupt) interrupt.disabled = !state.claude.busy;
+  const sendBtn = $("claude-send");
+  if (sendBtn) sendBtn.disabled = state.claude.state === "starting";
+  const banner = $("claude-conn-banner");
+  if (banner) {
+    if (state.claude.state === "error" && state.claude.error) {
+      banner.className = "conn-banner error";
+      banner.textContent = state.claude.error;
+    } else if (state.claude.state === "starting") {
+      banner.className = "conn-banner";
+      banner.textContent = t("claude.state.starting");
+    } else {
+      banner.className = "conn-banner hidden";
+      banner.textContent = "";
+    }
+  }
+  if (state.claude.sessions && state.uiMode === "claude") {
+    renderSessions(state.claude.sessions);
+  }
+  const nextView = state.viewClaudeSessionId;
+  if (
+    Array.isArray(msg.transcript)
+    && nextView
+    && (nextView !== prevView || state.claudeReplayPending)
+  ) {
+    state.claudeReplayPending = false;
+    replayPanelTranscript("claude", msg.transcript);
+  }
+}
+
+function panelAttachBucket() {
+  if (state.uiMode === "codex") return state.codexAttachments;
+  if (state.uiMode === "claude") return state.claudeAttachments;
+  return state.pendingImages;
+}
+
+function renderPanelAttachStrip(mode) {
+  const strip = $(mode === "claude" ? "claude-attach-strip" : "codex-attach-strip");
+  if (!strip) return;
+  const items = mode === "claude" ? state.claudeAttachments : state.codexAttachments;
+  strip.innerHTML = "";
+  if (!items.length) {
+    strip.classList.add("hidden");
+    return;
+  }
+  strip.classList.remove("hidden");
+  items.forEach((image, index) => {
+    const chip = el("div", "attach-chip");
+    const img = el("img");
+    img.src = image.dataUrl || image.data_url || "";
+    img.alt = image.name || `img-${index + 1}`;
+    chip.appendChild(img);
+    const remove = el("button", "attach-remove", "×");
+    remove.type = "button";
+    remove.onclick = () => {
+      items.splice(index, 1);
+      renderPanelAttachStrip(mode);
+    };
+    chip.appendChild(remove);
+    strip.appendChild(chip);
+  });
+}
+
+function renderClaudeProfileSelect() {
+  const select = $("claude-profile-select");
+  if (!select) return;
+  const profiles = state.claude.profiles || [];
+  const current = state.claude.selection || state.claude.profile_id || "anthropic";
+  select.innerHTML = profiles.map((p) => {
+    const bits = [];
+    if (p.auth_mode === "login") bits.push("login");
+    else if (p.has_secret) bits.push("key");
+    else if (p.env_key) bits.push(`$${p.env_key}`);
+    if (p.proxy === "direct" || p.proxy_label === "直连" || p.proxy_label === "direct") {
+      bits.push("直连");
+    } else if (p.proxy_label && p.proxy_label !== "跟随系统" && p.proxy_label !== "system") {
+      bits.push(p.proxy_label);
+    }
+    const mark = bits.length ? ` · ${bits.join(" · ")}` : "";
+    return `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}${escapeHtml(mark)}</option>`;
+  }).join("") || '<option value="anthropic">Anthropic · API Key</option><option value="login">Anthropic · 订阅登录</option>';
+  select.value = current;
+  const tpl = $("claude-tpl-select");
+  if (tpl) {
+    const templates = state.claude.templates || [];
+    const prev = tpl.value;
+    tpl.innerHTML = templates.map((item) =>
+      `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name || item.id)}</option>`
+    ).join("") || '<option value="anthropic">Anthropic</option>';
+    if (prev) tpl.value = prev;
+  }
+  renderImportAccountSelect("claude");
+  const loginBtn = $("claude-login");
+  if (loginBtn) {
+    const mode = state.claude.auth_mode || "";
+    const selected = profiles.find((p) => p.id === select.value);
+    const needsLogin = mode === "login" || (selected && selected.auth_mode === "login");
+    loginBtn.classList.toggle("hidden", false);
+    loginBtn.title = needsLogin
+      ? "打开 Claude 订阅登录"
+      : "也可登录订阅账号（会切换到登录 Profile）";
+  }
+}
+
+function suggestNewProfileId(panel, base) {
+  const profiles = ((panel === "claude" ? state.claude : state.codex).profiles) || [];
+  const ids = new Set(profiles.map((item) => item.id));
+  if (!ids.has(base)) return base;
+  for (let index = 2; index < 100; index += 1) {
+    const candidate = `${base}-${index}`;
+    if (!ids.has(candidate)) return candidate;
+  }
+  return `${base}-${Date.now()}`;
+}
+
+function prepareNewProfileForm(panel) {
+  const tplSelect = $(panel === "claude" ? "claude-tpl-select" : "codex-tpl-select");
+  const idBox = $(panel === "claude" ? "claude-pf-id" : "codex-pf-id");
+  const nameBox = $(panel === "claude" ? "claude-pf-name" : "codex-pf-name");
+  const envBox = $(panel === "claude" ? "claude-pf-env" : "codex-pf-env");
+  const tplId = (tplSelect && tplSelect.value) || (panel === "claude" ? "anthropic" : "kimi");
+  const base = tplId === "custom" ? "profile" : tplId;
+  const nextId = suggestNewProfileId(panel, base);
+  if (idBox) idBox.value = nextId;
+  if (nameBox) nameBox.value = nextId;
+  if (envBox) envBox.value = "";
+  if (panel === "claude") fillClaudeProfileFormFromTemplate();
+  else fillCodexProfileFormFromTemplate();
+  // fill* reloads selected profile; force the new id/name after.
+  if (idBox) idBox.value = nextId;
+  if (nameBox) nameBox.value = nextId;
+  if (envBox) envBox.value = "";
+  const templates = ((panel === "claude" ? state.claude : state.codex).templates) || [];
+  const tpl = templates.find((item) => item.id === tplId) || {};
+  const urlBox = $(panel === "claude" ? "claude-pf-url" : "codex-pf-url");
+  const modelBox = $(panel === "claude" ? "claude-pf-model" : "codex-pf-model");
+  if (urlBox) urlBox.value = tpl.base_url || "";
+  if (modelBox) modelBox.value = tpl.model || "";
+  if (envBox && tpl.env_key) envBox.placeholder = tpl.env_key;
+}
+
+function fillClaudeProfileFormFromTemplate() {
+  const tplId = ($("claude-tpl-select") && $("claude-tpl-select").value) || "anthropic";
+  const templates = state.claude.templates || [];
+  const tpl = templates.find((item) => item.id === tplId) || {};
+  const profiles = state.claude.profiles || [];
+  const selectedId = ($("claude-profile-select") && $("claude-profile-select").value) || "";
+  const selected = profiles.find((item) => item.id === selectedId);
+  const idBox = $("claude-pf-id");
+  const nameBox = $("claude-pf-name");
+  const urlBox = $("claude-pf-url");
+  const modelBox = $("claude-pf-model");
+  const envBox = $("claude-pf-env");
+  const proxyBox = $("claude-pf-proxy");
+  if (selected && selected.id) {
+    if (idBox) idBox.value = selected.id;
+    if (nameBox) nameBox.value = selected.name || "";
+    if (urlBox) urlBox.value = selected.base_url || "";
+    if (modelBox) modelBox.value = selected.model || "";
+    if (envBox) envBox.value = selected.env_key || "";
+    if (proxyBox) proxyBox.value = selected.proxy || "";
+    if ($("claude-tpl-select") && selected.template) {
+      $("claude-tpl-select").value = selected.template;
+    }
+    return;
+  }
+  if (idBox && !idBox.value) idBox.value = tplId === "custom" ? "" : `${tplId}-1`;
+  if (nameBox && !nameBox.value) nameBox.value = tpl.name || "";
+  if (urlBox) urlBox.value = tpl.base_url || urlBox.value || "";
+  if (modelBox) modelBox.value = tpl.model || modelBox.value || "";
+  if (envBox && !envBox.value) envBox.value = tpl.env_key || "ANTHROPIC_API_KEY";
+  if (proxyBox && !proxyBox.value) proxyBox.value = "";
+}
+
+function panelImagesPayload(mode) {
+  const items = mode === "claude" ? state.claudeAttachments : state.codexAttachments;
+  return items.map((image) => ({
+    data_url: image.dataUrl || image.data_url || "",
+    mime: image.mime || "image/png",
+    name: image.name || "image.png",
+    path: image.path || "",
+  }));
+}
+
+function panelPasteImages(event, mode) {
+  const files = Array.from((event.clipboardData && event.clipboardData.files) || []);
+  const imageFiles = files.filter((file) => ATTACH_MIME.has((file.type || "").toLowerCase()));
+  if (!imageFiles.length) return;
+  event.preventDefault();
+  enqueuePanelImageFiles(imageFiles, mode);
+}
+
+function wirePanelDrop(host, mode) {
+  if (!host) return;
+  host.ondragenter = (event) => { event.preventDefault(); host.classList.add("drag-over"); };
+  host.ondragover = (event) => { event.preventDefault(); host.classList.add("drag-over"); };
+  host.ondragleave = (event) => {
+    if (!host.contains(event.relatedTarget)) host.classList.remove("drag-over");
+  };
+  host.ondrop = (event) => {
+    event.preventDefault();
+    host.classList.remove("drag-over");
+    enqueuePanelImageFiles(event.dataTransfer && event.dataTransfer.files, mode);
+  };
+}
+
+function enqueuePanelImageFiles(fileList, mode) {
+  const files = Array.from(fileList || []).filter((file) => ATTACH_MIME.has((file.type || "").toLowerCase()));
+  if (!files.length) return;
+  const bucket = mode === "claude" ? state.claudeAttachments : state.codexAttachments;
+  files.forEach((file) => {
+    if (bucket.length >= ATTACH_MAX_COUNT) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || "");
+      const base64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : "";
+      bucket.push({
+        mime: (file.type || "image/png").toLowerCase(),
+        name: file.name || "image.png",
+        data: base64,
+        dataUrl,
+        data_url: dataUrl,
+      });
+      renderPanelAttachStrip(mode);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function codexTranscript() {
+  return $("codex-transcript");
+}
+
+function panelTranscript(mode) {
+  return mode === "claude" ? claudeTranscript() : codexTranscript();
+}
+
+function panelTools(mode) {
+  return mode === "claude" ? state.claudeTools : state.codexTools;
+}
+
+function setPanelActivity(mode, text, kind) {
+  const dockId = mode === "claude" ? "claude-activity-dock" : "codex-activity-dock";
+  const dock = $(dockId);
+  if (!dock) return;
+  if (!text || kind === "clear") {
+    dock.innerHTML = "";
+    dock.classList.add("hidden");
+    return;
+  }
+  dock.classList.remove("hidden");
+  let row = dock.querySelector(".activity");
+  if (!row) {
+    row = el("div", `activity ${kind || "busy"}`, text);
+    dock.appendChild(row);
+  } else {
+    row.className = `activity ${kind || "busy"}`;
+    row.textContent = text;
+  }
+}
+
+function clearPanelActivity(mode) {
+  setPanelActivity(mode, "", "clear");
+}
+
+function addPanelToolEntry(mode, msg) {
+  const host = panelTranscript(mode);
+  const tools = panelTools(mode);
+  if (!host || !msg || !msg.call_id) return;
+  if (tools.has(msg.call_id)) return;
+  const box = el("div", "entry tool running");
+  const head = el("div", "tool-head");
+  head.append(
+    el("span", "tool-glyph", "⟳"),
+    el("span", "tool-name", msg.headline || msg.name || "tool"),
+    el("span", "tool-summary", ""),
+    el("span", "tool-time", ""),
+  );
+  const body = el("div", "tool-body hidden");
+  head.onclick = () => body.classList.toggle("hidden");
+  box.append(head, body);
+  tools.set(msg.call_id, { box, head, body, args: msg.args || {} });
+  host.appendChild(box);
+  host.scrollTop = host.scrollHeight;
+}
+
+function completePanelToolEntry(mode, msg) {
+  const tools = panelTools(mode);
+  if (!msg || !msg.call_id) return;
+  const entry = tools.get(msg.call_id);
+  if (!entry) return;
+  tools.delete(msg.call_id);
+  entry.box.classList.remove("running");
+  entry.box.classList.add(msg.is_error ? "failed" : "ok");
+  entry.head.children[0].textContent = msg.is_error ? "✗" : "✓";
+  entry.head.children[2].textContent = msg.summary || msg.name || "";
+  if (msg.duration) {
+    entry.head.children[3].textContent = `${Number(msg.duration).toFixed(1)}s`;
+  }
+  entry.body.textContent = msg.content || "";
+  // Match Agent: keep successful tool output collapsed; only expand failures.
+  // Click the header to open details.
+  if (msg.is_error) entry.body.classList.remove("hidden");
+  else entry.body.classList.add("hidden");
+  if (msg.content && !entry.head.querySelector(".copy-btn")) {
+    const copy = el("button", "copy-btn", t("copy"));
+    copy.type = "button";
+    copy.title = t("copyTool");
+    copy.onclick = (event) => {
+      event.stopPropagation();
+      copyText(msg.content, copy);
+    };
+    entry.head.appendChild(copy);
+  }
+  if (!msg.is_error) regroupPanelTools(entry.box);
+  const host = panelTranscript(mode);
+  if (host) host.scrollTop = host.scrollHeight;
+}
+
+/** Fold consecutive finished Codex/Claude tool rows (same idea as Agent regroupTools). */
+function regroupPanelTools(box) {
+  const previous = box.previousElementSibling;
+  const existing = groupOf(previous);
+  if (existing) {
+    existing.querySelector(".tool-group-body").appendChild(box);
+    countGroup(existing);
+    return;
+  }
+  if (!previous || !previous.classList.contains("tool") ||
+      previous.classList.contains("running") ||
+      previous.classList.contains("failed")) {
+    return;
+  }
+  const group = el("div", "entry tool-group");
+  const head = el("div", "tool-group-head");
+  head.append(el("span", "tool-glyph", "›"), el("span", "tool-group-label", ""));
+  const body = el("div", "tool-group-body hidden");
+  head.onclick = () => {
+    body.classList.toggle("hidden");
+    head.querySelector(".tool-glyph").textContent =
+      body.classList.contains("hidden") ? "›" : "⌄";
+  };
+  group.append(head, body);
+  previous.replaceWith(group);
+  body.append(previous, box);
+  countGroup(group);
+}
+
+function appendPanelThinking(mode, delta) {
+  if (!delta) return;
+  const host = panelTranscript(mode);
+  if (!host) return;
+  const key = mode === "claude" ? "claudeThinking" : "codexThinking";
+  let box = state[key];
+  if (!box || !host.contains(box)) {
+    box = el("div", "entry thinking");
+    const head = el("div", "thinking-head");
+    head.append(el("span", "thinking-glyph", "›"), el("span", "thinking-label", "thinking"));
+    const body = el("div", "thinking-body");
+    head.onclick = () => box.classList.toggle("collapsed");
+    box.append(head, body);
+    host.appendChild(box);
+    state[key] = box;
+  }
+  const body = box.querySelector(".thinking-body");
+  if (body) body.textContent = (body.textContent || "") + delta;
+  host.scrollTop = host.scrollHeight;
+}
+
+function addCodexEntry(kind, text) {
+  const host = codexTranscript();
+  if (!host || !text) return null;
+  const node = el("div", `entry ${kind}`);
+  node.innerHTML = kind === "assistant"
+    ? renderMarkdown(text)
+    : `<p>${escapeHtml(text)}</p>`;
+  host.appendChild(node);
+  host.scrollTop = host.scrollHeight;
+  return node;
+}
+
+function appendCodexText(delta) {
+  if (!delta) return;
+  state.codexBuffer = (state.codexBuffer || "") + delta;
+  const host = codexTranscript();
+  if (!host) return;
+  if (!state.codexStreaming || !host.contains(state.codexStreaming)) {
+    const node = el("div", "entry assistant");
+    node.textContent = state.codexBuffer;
+    host.appendChild(node);
+    state.codexStreaming = node;
+  } else {
+    state.codexStreaming.textContent = state.codexBuffer;
+  }
+  host.scrollTop = host.scrollHeight;
+}
+
+function finishCodexStream() {
+  if (state.codexStreaming && state.codexBuffer) {
+    state.codexStreaming.innerHTML = renderMarkdown(state.codexBuffer);
+  }
+  state.codexStreaming = null;
+  state.codexBuffer = "";
+  state.codexThinking = null;
+}
+
+function submitCodexPrompt() {
+  const box = $("codex-prompt");
+  if (!box) return;
+  const text = (box.value || "").trim();
+  const images = panelImagesPayload("codex");
+  if (!text && !images.length) return;
+  addCodexEntry("user", text || `(${images.length} image)`);
+  box.value = "";
+  box.style.height = `${COMPOSER_MIN_HEIGHT_PX}px`;
+  state.codexAttachments = [];
+  renderPanelAttachStrip("codex");
+  state.codex.busy = true;
+  state.codexThinking = null;
+  setPanelActivity("codex", t("activity.sending") || "发送中…", "pending");
+  applyCodexStatus({ ...state.codex, busy: true });
+  if (!send("codex_prompt", { text, images })) {
+    toast(t("conn.offlineSend"), "warn");
+  }
+}
+
+function showCodexPermissionInline(msg) {
+  const host = codexTranscript();
+  if (!host) return;
+  const card = el("div", "entry hitl");
+  const title = el("div", "hitl-title", t("codex.hitlTitle"));
+  card.appendChild(title);
+  if (msg.reason) card.appendChild(el("div", "hint", msg.reason));
+  if (msg.detail) card.appendChild(el("div", "modal-code", String(msg.detail)));
+  const actions = el("div", "hitl-actions");
+  const finish = (decision) => {
+    card.remove();
+    send("codex_approve", { id: msg.id, decision });
+  };
+  actions.append(
+    hitlButton(t("codex.decline"), false, () => finish("decline")),
+    hitlButton(t("codex.acceptSession"), false, () => finish("acceptForSession")),
+    hitlButton(t("codex.accept"), true, () => finish("accept")),
+  );
+  card.appendChild(actions);
+  host.appendChild(card);
+  host.scrollTop = host.scrollHeight;
+}
+
+function claudeTranscript() {
+  return $("claude-transcript");
+}
+
+function addClaudeEntry(kind, text) {
+  const host = claudeTranscript();
+  if (!host || !text) return null;
+  const node = el("div", `entry ${kind}`);
+  node.innerHTML = kind === "assistant"
+    ? renderMarkdown(text)
+    : `<p>${escapeHtml(text)}</p>`;
+  host.appendChild(node);
+  host.scrollTop = host.scrollHeight;
+  return node;
+}
+
+function appendClaudeText(delta) {
+  if (!delta) return;
+  state.claudeBuffer = (state.claudeBuffer || "") + delta;
+  const host = claudeTranscript();
+  if (!host) return;
+  if (!state.claudeStreaming || !host.contains(state.claudeStreaming)) {
+    const node = el("div", "entry assistant");
+    node.textContent = state.claudeBuffer;
+    host.appendChild(node);
+    state.claudeStreaming = node;
+  } else {
+    state.claudeStreaming.textContent = state.claudeBuffer;
+  }
+  host.scrollTop = host.scrollHeight;
+}
+
+function finishClaudeStream() {
+  if (state.claudeStreaming && state.claudeBuffer) {
+    state.claudeStreaming.innerHTML = renderMarkdown(state.claudeBuffer);
+  }
+  state.claudeStreaming = null;
+  state.claudeBuffer = "";
+  state.claudeThinking = null;
+}
+
+function submitClaudePrompt() {
+  const box = $("claude-prompt");
+  if (!box) return;
+  const text = (box.value || "").trim();
+  const images = panelImagesPayload("claude");
+  if (!text && !images.length) return;
+  addClaudeEntry("user", text || `(${images.length} image)`);
+  box.value = "";
+  box.style.height = `${COMPOSER_MIN_HEIGHT_PX}px`;
+  state.claudeAttachments = [];
+  renderPanelAttachStrip("claude");
+  state.claude.busy = true;
+  state.claudeThinking = null;
+  setPanelActivity("claude", t("activity.sending") || "发送中…", "pending");
+  applyClaudeStatus({ ...state.claude, busy: true });
+  if (!send("claude_prompt", { text, images })) {
+    toast(t("conn.offlineSend"), "warn");
+  }
+}
+
+function showClaudePermissionInline(msg) {
+  const host = claudeTranscript();
+  if (!host) return;
+  const card = el("div", "entry hitl");
+  card.appendChild(el("div", "hitl-title", t("claude.hitlTitle")));
+  if (msg.reason) card.appendChild(el("div", "hint", msg.reason));
+  if (msg.detail) card.appendChild(el("div", "modal-code", String(msg.detail)));
+  const actions = el("div", "hitl-actions");
+  const finish = (decision) => {
+    card.remove();
+    send("claude_approve", { id: msg.id, decision });
+  };
+  actions.append(
+    hitlButton(t("claude.decline"), false, () => finish("deny")),
+    hitlButton(t("claude.accept"), true, () => finish("accept")),
+  );
+  card.appendChild(actions);
+  host.appendChild(card);
+  host.scrollTop = host.scrollHeight;
+}
+
+function fillCodexProfileFormFromTemplate() {
+  const tplId = ($("codex-tpl-select") && $("codex-tpl-select").value) || "custom";
+  const templates = state.codex.templates || [];
+  const tpl = templates.find((item) => item.id === tplId) || {};
+  const profiles = state.codex.profiles || [];
+  const selectedId = ($("codex-profile-select") && $("codex-profile-select").value) || "";
+  const selected = profiles.find((item) => item.id === selectedId);
+  const idBox = $("codex-pf-id");
+  const nameBox = $("codex-pf-name");
+  const urlBox = $("codex-pf-url");
+  const modelBox = $("codex-pf-model");
+  const envBox = $("codex-pf-env");
+  const proxyBox = $("codex-pf-proxy");
+  if (selected && selected.id && selected.id !== "default") {
+    if (idBox) idBox.value = selected.id;
+    if (nameBox) nameBox.value = selected.name || "";
+    if (urlBox) urlBox.value = selected.base_url || "";
+    if (modelBox) modelBox.value = selected.model || "";
+    if (envBox) envBox.value = selected.env_key || "";
+    if (proxyBox) proxyBox.value = selected.proxy || "";
+    if ($("codex-tpl-select") && selected.template) {
+      $("codex-tpl-select").value = selected.template;
+    }
+    return;
+  }
+  if (idBox && !idBox.value) idBox.value = tplId === "custom" ? "" : `${tplId}-1`;
+  if (nameBox && !nameBox.value) nameBox.value = tpl.name || "";
+  if (urlBox) urlBox.value = tpl.base_url || urlBox.value;
+  if (modelBox) modelBox.value = tpl.model || modelBox.value;
+  if (envBox && !envBox.value) envBox.value = tpl.env_key || "";
+  if (proxyBox && !proxyBox.value) {
+    // Domestic APIs usually prefer direct; foreign ones can use Clash.
+    proxyBox.value = (tplId === "kimi" || tplId === "glm") ? "direct" : "";
+  }
+}
+
 function wire() {
   wireImageEditor();
+  wireImageViewer();
+  setUiMode("agent");
+  const modeAgent = $("mode-agent");
+  const modeCodex = $("mode-codex");
+  const modeClaude = $("mode-claude");
+  if (modeAgent) modeAgent.onclick = () => setUiMode("agent");
+  if (modeCodex) {
+    modeCodex.onclick = () => {
+      setUiMode("codex");
+      send("codex_start", {});
+    };
+  }
+  if (modeClaude) {
+    modeClaude.onclick = () => {
+      setUiMode("claude");
+      send("claude_start", {});
+    };
+  }
+  const codexProfile = $("codex-profile-select");
+  if (codexProfile) {
+    codexProfile.onchange = () => {
+      send("codex_set_profile", { selection: codexProfile.value || "default" });
+    };
+  }
+  const codexModel = $("codex-model-select");
+  if (codexModel) {
+    codexModel.onchange = () => {
+      const value = codexModel.value || "";
+      if (!value) return;
+      send("codex_set_model", { model: value });
+    };
+  }
+  const codexEffort = $("codex-effort-select");
+  if (codexEffort) {
+    codexEffort.onchange = () => {
+      send("codex_set_effort", { effort: codexEffort.value || "" });
+    };
+  }
+  const profileEdit = $("codex-profile-edit");
+  if (profileEdit) {
+    profileEdit.onclick = () => {
+      const form = $("codex-profile-form");
+      if (!form) return;
+      form.classList.toggle("hidden");
+      if (!form.classList.contains("hidden")) {
+        renderCodexProfileSelect();
+        fillCodexProfileFormFromTemplate();
+      }
+    };
+  }
+  const tplSelect = $("codex-tpl-select");
+  if (tplSelect) {
+    tplSelect.onchange = () => {
+      const idBox = $("codex-pf-id");
+      const nameBox = $("codex-pf-name");
+      if (idBox) idBox.value = "";
+      if (nameBox) nameBox.value = "";
+      fillCodexProfileFormFromTemplate();
+    };
+  }
+  const pfSave = $("codex-pf-save");
+  if (pfSave) {
+    pfSave.onclick = () => {
+      const tpl = ($("codex-tpl-select") && $("codex-tpl-select").value) || "custom";
+      const keyOrEnv = (($("codex-pf-env") && $("codex-pf-env").value) || "").trim();
+      const payload = {
+        id: (($("codex-pf-id") && $("codex-pf-id").value) || "").trim(),
+        name: (($("codex-pf-name") && $("codex-pf-name").value) || "").trim(),
+        base_url: (($("codex-pf-url") && $("codex-pf-url").value) || "").trim(),
+        model: (($("codex-pf-model") && $("codex-pf-model").value) || "").trim(),
+        proxy: (($("codex-pf-proxy") && $("codex-pf-proxy").value) || "").trim(),
+        template: tpl,
+        make_active: true,
+        activate: true,
+      };
+      if (/^[A-Z][A-Z0-9_]{2,}$/.test(keyOrEnv)) {
+        payload.env_key = keyOrEnv;
+      } else if (keyOrEnv) {
+        payload.api_key = keyOrEnv;
+        const templates = state.codex.templates || [];
+        const titem = templates.find((item) => item.id === tpl);
+        if (titem && titem.env_key) payload.env_key = titem.env_key;
+      }
+      send("codex_upsert_profile", payload);
+    };
+  }
+  const pfDelete = $("codex-pf-delete");
+  if (pfDelete) {
+    pfDelete.onclick = () => {
+      const id = (($("codex-pf-id") && $("codex-pf-id").value)
+        || ($("codex-profile-select") && $("codex-profile-select").value)
+        || "").trim();
+      if (!id || id === "default") return;
+      send("codex_delete_profile", { id });
+    };
+  }
+  const pfNew = $("codex-pf-new");
+  if (pfNew) pfNew.onclick = () => prepareNewProfileForm("codex");
+  const pfImport = $("codex-pf-import");
+  if (pfImport) {
+    pfImport.onclick = () => {
+      const accountId = (($("codex-import-account") && $("codex-import-account").value) || "").trim();
+      if (!accountId) {
+        toast(t("codex.importEmpty"), "warn");
+        return;
+      }
+      send("codex_import_account", { account_id: accountId, activate: true });
+    };
+  }
+  const codexMode = $("codex-mode-select");
+  if (codexMode) {
+    codexMode.onchange = (event) => send("codex_set_mode", { mode: event.target.value });
+  }
+  const codexStart = $("codex-start");
+  if (codexStart) codexStart.onclick = () => send("codex_start", {});
+  const codexStop = $("codex-stop");
+  if (codexStop) codexStop.onclick = () => send("codex_stop", {});
+  const codexSend = $("codex-send");
+  if (codexSend) codexSend.onclick = submitCodexPrompt;
+  const codexInterrupt = $("codex-interrupt");
+  if (codexInterrupt) {
+    codexInterrupt.onclick = () => send("codex_interrupt", {});
+  }
+  const codexShot = $("codex-screenshot");
+  if (codexShot) codexShot.onclick = requestScreenshot;
+  const codexBox = $("codex-prompt");
+  if (codexBox) {
+    codexBox.onkeydown = (event) => {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        submitCodexPrompt();
+      }
+    };
+    codexBox.oninput = () => {
+      codexBox.style.height = "auto";
+      codexBox.style.height = Math.min(codexBox.scrollHeight, COMPOSER_MAX_HEIGHT_PX) + "px";
+    };
+    codexBox.onpaste = (event) => panelPasteImages(event, "codex");
+    wirePanelDrop($("codex-composer"), "codex");
+    codexBox.style.height = `${COMPOSER_MIN_HEIGHT_PX}px`;
+  }
+  const claudeProfile = $("claude-profile-select");
+  if (claudeProfile) {
+    claudeProfile.onchange = () => {
+      send("claude_set_profile", { selection: claudeProfile.value || "anthropic" });
+    };
+  }
+  const claudeModel = $("claude-model-select");
+  if (claudeModel) {
+    claudeModel.onchange = () => {
+      const value = claudeModel.value || "";
+      if (!value) return;
+      send("claude_set_model", { model: value });
+    };
+  }
+  const claudeEffort = $("claude-effort-select");
+  if (claudeEffort) {
+    claudeEffort.onchange = () => {
+      send("claude_set_effort", { effort: claudeEffort.value || "" });
+    };
+  }
+  const claudeProfileEdit = $("claude-profile-edit");
+  if (claudeProfileEdit) {
+    claudeProfileEdit.onclick = () => {
+      const form = $("claude-profile-form");
+      if (!form) return;
+      form.classList.toggle("hidden");
+      if (!form.classList.contains("hidden")) {
+        renderClaudeProfileSelect();
+        fillClaudeProfileFormFromTemplate();
+      }
+    };
+  }
+  const claudeTpl = $("claude-tpl-select");
+  if (claudeTpl) {
+    claudeTpl.onchange = () => {
+      const idBox = $("claude-pf-id");
+      const nameBox = $("claude-pf-name");
+      if (idBox) idBox.value = "";
+      if (nameBox) nameBox.value = "";
+      fillClaudeProfileFormFromTemplate();
+    };
+  }
+  const claudePfSave = $("claude-pf-save");
+  if (claudePfSave) {
+    claudePfSave.onclick = () => {
+      const tpl = ($("claude-tpl-select") && $("claude-tpl-select").value) || "anthropic";
+      const keyOrEnv = (($("claude-pf-env") && $("claude-pf-env").value) || "").trim();
+      const payload = {
+        id: (($("claude-pf-id") && $("claude-pf-id").value) || "").trim(),
+        name: (($("claude-pf-name") && $("claude-pf-name").value) || "").trim(),
+        base_url: (($("claude-pf-url") && $("claude-pf-url").value) || "").trim(),
+        model: (($("claude-pf-model") && $("claude-pf-model").value) || "").trim(),
+        proxy: (($("claude-pf-proxy") && $("claude-pf-proxy").value) || "").trim(),
+        template: tpl,
+        make_active: true,
+        activate: true,
+      };
+      if (/^[A-Z][A-Z0-9_]{2,}$/.test(keyOrEnv)) {
+        payload.env_key = keyOrEnv;
+      } else if (keyOrEnv) {
+        payload.api_key = keyOrEnv;
+        payload.env_key = "ANTHROPIC_API_KEY";
+      }
+      send("claude_upsert_profile", payload);
+    };
+  }
+  const claudePfDelete = $("claude-pf-delete");
+  if (claudePfDelete) {
+    claudePfDelete.onclick = () => {
+      const id = (($("claude-pf-id") && $("claude-pf-id").value)
+        || ($("claude-profile-select") && $("claude-profile-select").value)
+        || "").trim();
+      if (!id) return;
+      send("claude_delete_profile", { id });
+    };
+  }
+  const claudePfNew = $("claude-pf-new");
+  if (claudePfNew) claudePfNew.onclick = () => prepareNewProfileForm("claude");
+  const claudePfImport = $("claude-pf-import");
+  if (claudePfImport) {
+    claudePfImport.onclick = () => {
+      const accountId = (($("claude-import-account") && $("claude-import-account").value) || "").trim();
+      if (!accountId) {
+        toast(t("codex.importEmpty"), "warn");
+        return;
+      }
+      send("claude_import_account", { account_id: accountId, activate: true });
+    };
+  }
+  const claudeMode = $("claude-mode-select");
+  if (claudeMode) {
+    claudeMode.onchange = (event) => send("claude_set_mode", { mode: event.target.value });
+  }
+  const claudeLogin = $("claude-login");
+  if (claudeLogin) {
+    claudeLogin.onclick = () => {
+      const sel = ($("claude-profile-select") && $("claude-profile-select").value) || "";
+      send("claude_login", { selection: sel });
+    };
+  }
+  const claudeStart = $("claude-start");
+  if (claudeStart) claudeStart.onclick = () => send("claude_start", {});
+  const claudeStop = $("claude-stop");
+  if (claudeStop) claudeStop.onclick = () => send("claude_stop", {});
+  const claudeSend = $("claude-send");
+  if (claudeSend) claudeSend.onclick = submitClaudePrompt;
+  const claudeInterrupt = $("claude-interrupt");
+  if (claudeInterrupt) claudeInterrupt.onclick = () => send("claude_interrupt", {});
+  const claudeShot = $("claude-screenshot");
+  if (claudeShot) claudeShot.onclick = requestScreenshot;
+  const claudeBox = $("claude-prompt");
+  if (claudeBox) {
+    claudeBox.onkeydown = (event) => {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        submitClaudePrompt();
+      }
+    };
+    claudeBox.oninput = () => {
+      claudeBox.style.height = "auto";
+      claudeBox.style.height = Math.min(claudeBox.scrollHeight, COMPOSER_MAX_HEIGHT_PX) + "px";
+    };
+    claudeBox.onpaste = (event) => panelPasteImages(event, "claude");
+    wirePanelDrop($("claude-composer"), "claude");
+    claudeBox.style.height = `${COMPOSER_MIN_HEIGHT_PX}px`;
+  }
   $("send").onclick = submitPrompt;
   $("interrupt").onclick = () => {
     setActivity(t("activity.interrupting"), "busy");
@@ -3646,7 +5365,24 @@ function wire() {
     };
   }
   $("new-session").onclick = () => {
+    const prefix = panelSessionPrefix();
+    if (prefix === "codex") {
+      state.viewCodexSessionId = "";
+      state.codexReplayPending = true;
+      clearPanelTranscriptDom("codex");
+      send("codex_new_session", {});
+      return;
+    }
+    if (prefix === "claude") {
+      state.viewClaudeSessionId = "";
+      state.claudeReplayPending = true;
+      clearPanelTranscriptDom("claude");
+      send("claude_new_session", {});
+      return;
+    }
     flushDraftNow();
+    abandonLiveStreamView();
+    state.pinBottomOnReady = true;
     send("new_session", {});
   };
   $("goal-cancel").onclick = () => send("stop_heartbeat", {});
@@ -3800,7 +5536,13 @@ function wire() {
     };
   }
   const archiveToggle = $("archive-toggle");
-  if (archiveToggle) archiveToggle.onclick = () => send("toggle_archived", {});
+  if (archiveToggle) {
+    archiveToggle.onclick = () => {
+      const prefix = panelSessionPrefix();
+      if (prefix) send(`${prefix}_toggle_archived`, {});
+      else send("toggle_archived", {});
+    };
+  }
   $("mode-select").onchange = (event) => send("set_mode", { mode: event.target.value });
 
   $("account-form").onsubmit = (event) => {
