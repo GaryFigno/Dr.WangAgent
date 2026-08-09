@@ -427,8 +427,8 @@ class Agent:
           A notice string when images were saved but the model cannot see them,
           otherwise ``None``.
         """
-        note = build_environment_note(self.workspace, query=text)
-        display = text.strip()
+        note = build_environment_note(self.workspace, query=text or "")
+        display = (text or "").strip()
         refs: list[AttachmentRef] = []
         degrade_notice: str | None = None
         if images:
@@ -445,7 +445,7 @@ class Agent:
                 display = f"{display}\n\n{labels}".strip() if display else labels
         body = display or ("（见附图）" if refs else "")
         content = f"{note}\n\n{body}" if body else note
-        meta: dict[str, Any] = {"user_text": text.strip()}
+        meta: dict[str, Any] = {"user_text": display}
         if refs:
             meta["attachments"] = [ref.to_meta() for ref in refs]
         self._append(Message(role="user", content=content, meta=meta))

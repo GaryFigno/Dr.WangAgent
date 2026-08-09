@@ -659,7 +659,7 @@ async def compact(
         max_tokens=budget,
     )
 
-    summary = reply.message.content.strip()
+    summary = (reply.message.content or "").strip()
     if not summary:
         return messages, ""
 

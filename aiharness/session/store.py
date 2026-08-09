@@ -556,7 +556,7 @@ def _summary_pair(record: CompactionRecord) -> list[Message]:
 
 
 def _derive_title(text: str) -> str:
-    cleaned = " ".join(text.split())
+    cleaned = " ".join((text or "").split())
     if len(cleaned) <= SESSION_TITLE_CHARS:
         return cleaned
     return cleaned[: SESSION_TITLE_CHARS - 1] + "…"

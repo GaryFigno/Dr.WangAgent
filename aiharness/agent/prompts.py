@@ -289,7 +289,9 @@ def build_system_prompt(
     if extra:
         sections.append(extra)
 
-    return "\n\n".join(section.strip() for section in sections if section.strip())
+    return "\n\n".join(
+        section.strip() for section in sections if section and section.strip()
+    )
 
 
 def _git_summary(workspace: Path) -> str:
@@ -298,34 +300,45 @@ def _git_summary(workspace: Path) -> str:
         return ""
     try:
         hidden = hidden_subprocess_kwargs()
-        branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=GIT_COMMAND_TIMEOUT,
-            check=False,
-            **hidden,
-        ).stdout.strip()
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=GIT_COMMAND_TIMEOUT,
-            check=False,
-            **hidden,
-        ).stdout.strip()
-        log = subprocess.run(
-            ["git", "log", "-5", "--oneline", "--no-decorate"],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=GIT_COMMAND_TIMEOUT,
-            check=False,
-            **hidden,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+        # Windows + CREATE_NO_WINDOW can occasionally yield stdout=None; never
+        # call .strip() on that — it aborted the whole turn with AttributeError.
+        branch = (
+            subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=GIT_COMMAND_TIMEOUT,
+                check=False,
+                **hidden,
+            ).stdout
+            or ""
+        ).strip()
+        status = (
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=GIT_COMMAND_TIMEOUT,
+                check=False,
+                **hidden,
+            ).stdout
+            or ""
+        ).strip()
+        log = (
+            subprocess.run(
+                ["git", "log", "-5", "--oneline", "--no-decorate"],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=GIT_COMMAND_TIMEOUT,
+                check=False,
+                **hidden,
+            ).stdout
+            or ""
+        ).strip()
+    except (OSError, subprocess.SubprocessError, AttributeError):
         return ""
 
     if not branch:

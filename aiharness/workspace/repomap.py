@@ -45,7 +45,7 @@ def _dirty_paths(workspace: Path) -> set[str]:
     except (OSError, subprocess.SubprocessError):
         return set()
     dirty: set[str] = set()
-    for line in proc.stdout.splitlines():
+    for line in (proc.stdout or "").splitlines():
         path = line[3:].strip().replace("\\", "/")
         if " -> " in path:
             path = path.split(" -> ", 1)[-1]

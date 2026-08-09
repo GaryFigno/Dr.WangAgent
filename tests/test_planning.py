@@ -36,6 +36,8 @@ def test_extract_json_survives_fences_and_prose():
     assert extract_json('Sure! {"a": 2} hope that helps') == {"a": 2}
     with pytest.raises(ValueError):
         extract_json("no json here at all")
+    with pytest.raises(ValueError):
+        extract_json(None)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

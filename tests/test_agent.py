@@ -202,6 +202,24 @@ def test_system_prompt_is_stable_across_turns(workspace):
     assert "Date:" in build_environment_note(workspace)
 
 
+def test_git_summary_tolerates_null_stdout(workspace, monkeypatch):
+    """Windows CREATE_NO_WINDOW sometimes yields stdout=None; must not abort turn."""
+    import subprocess
+
+    from aiharness.agent import prompts as prompts_mod
+    from aiharness.agent.prompts import _git_summary
+
+    class _NullOut:
+        stdout = None
+        returncode = 0
+
+    (workspace / ".git").mkdir()
+    monkeypatch.setattr(prompts_mod.shutil, "which", lambda _name: "git")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _NullOut())
+    assert _git_summary(workspace) == ""
+    assert "Date:" in build_environment_note(workspace, query="hello")
+
+
 @pytest.mark.asyncio
 async def test_user_message_stamps_the_environment_note_once(fake, agent_parts, sessions):
     config, router, tools, permissions, workspace = agent_parts

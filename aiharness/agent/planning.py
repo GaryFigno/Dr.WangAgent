@@ -260,7 +260,7 @@ def extract_json(text: str) -> dict[str, Any]:
     Raises:
       ValueError: If nothing parseable is present.
     """
-    stripped = text.strip()
+    stripped = (text or "").strip()
     fenced = re.search(r"```(?:json)?\s*(.+?)```", stripped, re.DOTALL)
     if fenced:
         stripped = fenced.group(1).strip()

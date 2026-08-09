@@ -218,7 +218,11 @@ def git_tracked_and_visible_files(workspace: Path) -> list[str] | None:
         return None
     if proc.returncode != 0:
         return None
-    return [line.replace("\\", "/") for line in proc.stdout.splitlines() if line.strip()]
+    return [
+        line.replace("\\", "/")
+        for line in (proc.stdout or "").splitlines()
+        if line.strip()
+    ]
 
 
 def path_ignored(workspace: Path, path: Path) -> bool:
