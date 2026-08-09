@@ -58,6 +58,9 @@ class CodexSlot:
     busy: bool = False
     #: True once we saw streaming agentMessage deltas this turn (avoid duplicate full text).
     streamed_text: bool = False
+    #: Emit "回答中/思考中" activity at most once per turn (deltas are high-frequency).
+    activity_streaming: bool = False
+    activity_thinking: bool = False
 
 
 def default_home_path() -> Path:
@@ -292,7 +295,7 @@ class CodexRuntime:
             show_archived=self.show_archived,
         )
 
-    def status_payload(self) -> dict[str, Any]:
+    def status_payload(self, *, include_transcript: bool = False) -> dict[str, Any]:
         profile = None
         if self.selection != HOME_DEFAULT:
             profile = self.profiles.get(self.selection)
@@ -327,12 +330,17 @@ class CodexRuntime:
             "panel_session_id": self.viewed_id,
             "sessions": self._sessions_ui(),
         }
-        if self.viewed_id:
+        # Transcript is large — only attach on open/switch/reconnect, not every
+        # turn/status tick (that was freezing the WebView under stream load).
+        if include_transcript and self.viewed_id:
             payload["transcript"] = self.store.load_transcript(self.viewed_id)
         return payload
 
-    async def push_status(self) -> None:
-        await self._push("codex_status", self.status_payload())
+    async def push_status(self, *, include_transcript: bool = False) -> None:
+        await self._push(
+            "codex_status",
+            self.status_payload(include_transcript=include_transcript),
+        )
 
     def _ensure_viewed_meta(self) -> CodexSlot:
         """Create or hydrate the viewed panel session for the current workspace."""
@@ -567,7 +575,7 @@ class CodexRuntime:
                     "text": "已启用本地 Responses↔Chat 桥接（Kimi Coding）",
                 },
             )
-        await self.push_status()
+        await self.push_status(include_transcript=True)
 
     async def _prepare_bridge(self) -> bool:
         """Start or stop the local Responses bridge for chat-only providers."""
@@ -765,14 +773,14 @@ class CodexRuntime:
             except CodexRuntimeError as error:
                 self.last_error = str(error)
                 await self._emit("codex_error", {"message": self.last_error}, slot_id=slot.id)
-        await self.push_status()
+        await self.push_status(include_transcript=True)
 
     async def open_session(self, session_id: str) -> None:
         sid = (session_id or "").strip()
         if not sid:
             return
         if sid == self.viewed_id:
-            await self.push_status()
+            await self.push_status(include_transcript=True)
             return
         meta = self.store.get(sid)
         if meta is None:
@@ -796,7 +804,7 @@ class CodexRuntime:
             except CodexRuntimeError as error:
                 self.last_error = str(error)
                 await self._emit("codex_error", {"message": self.last_error}, slot_id=slot.id)
-        await self.push_status()
+        await self.push_status(include_transcript=True)
 
     async def delete_session(self, session_id: str) -> None:
         sid = (session_id or "").strip()
@@ -1320,7 +1328,13 @@ class CodexRuntime:
             if delta:
                 if slot is not None:
                     slot.streamed_text = True
-                await self._emit("codex_activity", {"text": "回答中…", "kind": "streaming"}, slot_id=slot_id)
+                    if not slot.activity_streaming:
+                        slot.activity_streaming = True
+                        await self._emit(
+                            "codex_activity",
+                            {"text": "回答中…", "kind": "streaming"},
+                            slot_id=slot_id,
+                        )
                 await self._emit("codex_text", {"delta": str(delta)}, slot_id=slot_id)
             return
         if method in {
@@ -1329,21 +1343,26 @@ class CodexRuntime:
         }:
             delta = params.get("delta")
             if delta:
-                await self._emit("codex_activity", {"text": "思考中…", "kind": "thinking"}, slot_id=slot_id)
+                if slot is not None and not slot.activity_thinking:
+                    slot.activity_thinking = True
+                    await self._emit(
+                        "codex_activity",
+                        {"text": "思考中…", "kind": "thinking"},
+                        slot_id=slot_id,
+                    )
                 await self._emit("codex_thinking", {"delta": str(delta)}, slot_id=slot_id)
             return
         if method == "item/reasoning/summaryPartAdded":
-            await self._emit("codex_activity", {"text": "思考中…", "kind": "thinking"}, slot_id=slot_id)
-            return
-        if method == "item/commandExecution/outputDelta":
-            delta = params.get("delta") or params.get("output") or ""
-            item_id = str(params.get("itemId") or params.get("item_id") or "")
-            if delta and item_id:
+            if slot is not None and not slot.activity_thinking:
+                slot.activity_thinking = True
                 await self._emit(
                     "codex_activity",
-                    {"text": f"命令输出… {str(delta)[:60]}", "kind": "busy"},
+                    {"text": "思考中…", "kind": "thinking"},
                     slot_id=slot_id,
                 )
+            return
+        if method == "item/commandExecution/outputDelta":
+            # High-frequency; final aggregated output arrives on item/completed.
             return
         if method == "item/started":
             item = params.get("item") if isinstance(params.get("item"), dict) else {}
@@ -1358,6 +1377,8 @@ class CodexRuntime:
             turn_id = str(turn["id"]) if isinstance(turn, dict) and turn.get("id") else None
             if slot is not None:
                 slot.streamed_text = False
+                slot.activity_streaming = False
+                slot.activity_thinking = False
             _mirror_busy(True, turn_id)
             await self._emit("codex_activity", {"text": "Codex 正在处理…", "kind": "busy"}, slot_id=slot_id)
             await self.push_status()
@@ -1365,6 +1386,8 @@ class CodexRuntime:
         if method == "turn/completed":
             if slot is not None:
                 slot.streamed_text = False
+                slot.activity_streaming = False
+                slot.activity_thinking = False
             _mirror_busy(False, None)
             # Best-effort: persist assistant buffer is handled by stream; mark done.
             await self._emit("codex_activity", {"text": "", "kind": "clear"}, slot_id=slot_id)

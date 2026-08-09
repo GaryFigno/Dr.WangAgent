@@ -92,4 +92,4 @@ python packaging/build.py --clean --installer
 
 ## 安全
 
-提交前请确认没有 `.env`、密钥、本机 `config.yaml`、收款码等敏感文件被跟踪。报告漏洞见 [`SECURITY.md`](SECURITY.md)。
+报告漏洞见 [`SECURITY.md`](SECURITY.md)。

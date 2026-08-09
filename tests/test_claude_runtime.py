@@ -404,3 +404,40 @@ async def test_system_status_clears_activity_when_idle(tmp_path: Path, monkeypat
     ]
     assert not stuck
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_while_ready_repushes_transcript(tmp_path: Path, monkeypatch):
+    """Switching back to the Claude tab must not leave the panel blank."""
+    events: list[tuple[str, dict]] = []
+
+    async def push(kind: str, payload: dict) -> None:
+        events.append((kind, payload))
+
+    async def park(_info: dict) -> str:
+        return "accept"
+
+    runtime = _ready_runtime(tmp_path, push, park)
+    fake = FakeProcess()
+
+    async def fake_exec(*_a, **_k):
+        return fake
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await runtime.start()
+    sid = runtime.viewed_id
+    assert sid
+    from aiharness.gui.panel_sessions import PanelTranscriptEntry
+
+    runtime.store.append_transcript(
+        sid, PanelTranscriptEntry(role="user", text="already on disk")
+    )
+    events.clear()
+    await runtime.start()
+    statuses = [p for k, p in events if k == "claude_status"]
+    assert statuses
+    assert "transcript" in statuses[-1]
+    assert any(
+        row.get("text") == "already on disk" for row in statuses[-1]["transcript"]
+    )
+    await runtime.stop()

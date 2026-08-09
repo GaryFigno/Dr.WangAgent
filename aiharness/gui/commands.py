@@ -123,14 +123,18 @@ async def _prompt(session: GuiSession, args: dict[str, Any]) -> None:
         images = parse_inbound_images(args.get("images"))
     except AttachmentError as error:
         await session.push(Outbound.NOTICE, level="warn", text=str(error))
+        # Frontend optimistically sets busy on send — resync so Send/Continue unstick.
+        await session.push_status()
         return
     if not text and not images and not refs:
+        await session.push_status()
         return
     view_id = session.session.meta.id
     if view_id in session.live:
         await session.push(
             Outbound.NOTICE, level="warn", text=session.msg("busy")
         )
+        await session.push_status()
         return
     # Sending clears the draft — keeping it would resurrect the prompt after
     # the turn finishes and look like the send failed.
@@ -143,6 +147,7 @@ async def _prompt(session: GuiSession, args: dict[str, Any]) -> None:
     if not wired and images:
         wired = "(see attached images)"
     if session.armed_limits is not None and await _launch_heartbeat(session, wired or text):
+        await session.push_status()
         return
     # Claim the live slot before the task starts so a second prompt cannot
     # interleave and park a user turn between tool_calls and tool results.
@@ -166,6 +171,7 @@ async def _prompt(session: GuiSession, args: dict[str, Any]) -> None:
         )
     except Exception:
         session.live.pop(view_id, None)
+        await session.push_status()
         raise
     session.live[view_id].task = task
     session._turn_task = task
@@ -695,6 +701,8 @@ async def _interrupt(session: GuiSession, args: dict[str, Any]) -> None:
         await session.push(
             Outbound.NOTICE, level="info", text=session.msg("interrupt.idle")
         )
+        # Clear a stuck optimistic busy on the frontend.
+        await session.push_status()
         return
     already = live.agent._cancel.is_set()
     live.agent.interrupt()
@@ -2372,13 +2380,35 @@ async def _resume_quest(session: GuiSession, args: dict[str, Any]) -> None:
         await session.push(
             Outbound.NOTICE, level="info", text=session.msg("quest.resumed")
         )
-        session._turn_task = asyncio.create_task(
-            run_turn(session, prompt.strip(), display_text=f"[Quest resume] {step}")
+        from .bridge import LiveTurn
+
+        session.live[sid] = LiveTurn(
+            session_id=sid,
+            handle=session.session,
+            agent=session.agent,
+            task=None,
         )
+        await session.push_status()
+        try:
+            task = asyncio.create_task(
+                run_turn(
+                    session,
+                    prompt.strip(),
+                    automatic=True,
+                    display_text=f"[Quest resume] {step}",
+                )
+            )
+        except Exception:
+            session.live.pop(sid, None)
+            await session.push_status()
+            raise
+        session.live[sid].task = task
+        session._turn_task = task
     else:
         await session.push(
             Outbound.NOTICE, level="info", text=session.msg("quest.resumed_idle")
         )
+        await session.push_status()
 
 
 async def _continue_work(session: GuiSession, args: dict[str, Any]) -> None:
@@ -2387,6 +2417,7 @@ async def _continue_work(session: GuiSession, args: dict[str, Any]) -> None:
         await session.push(
             Outbound.NOTICE, level="warn", text=session.msg("busy")
         )
+        await session.push_status()
         return
     sid = session.session.meta.id
     from ..quest import load_quest, quest_prompt_hint, resume_quest
@@ -2406,6 +2437,7 @@ async def _continue_work(session: GuiSession, args: dict[str, Any]) -> None:
         await session.push(
             Outbound.NOTICE, level="info", text=session.msg("todo.nothing_open")
         )
+        await session.push_status()
         return
     # Prefer resume_quest's path when a quest exists but was idle — otherwise
     # seed from todos alone.
@@ -2417,13 +2449,33 @@ async def _continue_work(session: GuiSession, args: dict[str, Any]) -> None:
         level="info",
         text=session.msg("todo.continuing", n=len(open_items)),
     )
-    session._turn_task = asyncio.create_task(
-        run_turn(
-            session,
-            prompt,
-            display_text=session.msg("todo.continue_label", n=len(open_items)),
-        )
+    # Claim live before scheduling so a second Continue/Send cannot race in.
+    from .bridge import LiveTurn
+
+    session.live[sid] = LiveTurn(
+        session_id=sid,
+        handle=session.session,
+        agent=session.agent,
+        task=None,
     )
+    await session.push_status()
+    try:
+        # automatic=True: skip re-classify. Manual Continue is resume, not a new
+        # request — re-scoring parked on AskUser and looked like a hang.
+        task = asyncio.create_task(
+            run_turn(
+                session,
+                prompt,
+                automatic=True,
+                display_text=session.msg("todo.continue_label", n=len(open_items)),
+            )
+        )
+    except Exception:
+        session.live.pop(sid, None)
+        await session.push_status()
+        raise
+    session.live[sid].task = task
+    session._turn_task = task
 
 
 async def _clear_quest(session: GuiSession, args: dict[str, Any]) -> None:

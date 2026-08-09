@@ -19,8 +19,6 @@ APP_NAME = "Dr.Wang"
 
 datas = [
     (str(PROJECT_ROOT / "aiharness" / "ui" / "styles.tcss"), "aiharness/ui"),
-    # The GUI frontend: HTML, CSS and JS are data, not importable modules.
-    (str(PROJECT_ROOT / "aiharness" / "gui" / "web"), "aiharness/gui/web"),
     (str(PROJECT_ROOT / "assets" / "icon.svg"), "assets"),
     (str(PROJECT_ROOT / "assets" / "icon-256.png"), "assets"),
     # Tray sizes. Without these the packaged tray falls back to a drawn
@@ -30,6 +28,27 @@ datas = [
     (str(PROJECT_ROOT / "assets" / "icon.ico"), "assets"),
     (str(PROJECT_ROOT / "README.md"), "."),
 ]
+
+# GUI frontend file-by-file so local donate QR images never ship.
+_WEB_ROOT = PROJECT_ROOT / "aiharness" / "gui" / "web"
+_DONATE_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+if _WEB_ROOT.is_dir():
+    for _path in _WEB_ROOT.rglob("*"):
+        if not _path.is_file():
+            continue
+        _rel = _path.relative_to(_WEB_ROOT)
+        if (
+            len(_rel.parts) >= 2
+            and _rel.parts[0] == "donate"
+            and _path.suffix.lower() in _DONATE_IMAGE_SUFFIXES
+        ):
+            continue
+        datas.append(
+            (
+                str(_path),
+                str(Path("aiharness/gui/web") / _rel.parent).replace("\\", "/"),
+            )
+        )
 # Textual ships its own CSS and widget assets.
 datas += collect_data_files("textual")
 

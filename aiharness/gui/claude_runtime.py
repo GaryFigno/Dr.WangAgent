@@ -63,6 +63,8 @@ class ClaudeSlot:
     stopping: bool = False
     state: str = "stopped"  # stopped | starting | ready | error
     last_error: str = ""
+    #: Persist native session_id to disk only when it changes (not every stream line).
+    persisted_native_id: str = ""
 
 
 def find_claude_executable() -> str | None:
@@ -216,7 +218,7 @@ class ClaudeRuntime:
             show_archived=self.show_archived,
         )
 
-    def status_payload(self) -> dict[str, Any]:
+    def status_payload(self, *, include_transcript: bool = False) -> dict[str, Any]:
         profile = self.profiles.get(self.selection)
         logged_in = bool(profile and self.profiles.is_logged_in(profile))
         model = self.selected_model or (profile.model if profile else "")
@@ -249,12 +251,15 @@ class ClaudeRuntime:
             "panel_session_id": self.viewed_id,
             "sessions": self._sessions_ui(),
         }
-        if self.viewed_id:
+        if include_transcript and self.viewed_id:
             payload["transcript"] = self.store.load_transcript(self.viewed_id)
         return payload
 
-    async def push_status(self) -> None:
-        await self._push("claude_status", self.status_payload())
+    async def push_status(self, *, include_transcript: bool = False) -> None:
+        await self._push(
+            "claude_status",
+            self.status_payload(include_transcript=include_transcript),
+        )
 
     def _ensure_viewed_meta(self) -> ClaudeSlot:
         from .workspace import is_app_install_workspace, preferred_project_workspace
@@ -331,6 +336,9 @@ class ClaudeRuntime:
         if self._slot_alive(slot) and slot.state == "ready":
             if slot.id == self.viewed_id:
                 self._apply_slot_to_viewed(slot)
+                # Tab re-entry / claude_start while already connected used to
+                # return silently — sidebar kept message counts, panel stayed empty.
+                await self.push_status(include_transcript=True)
             return
 
         await self._reap_orphan_clis(exclude_slot=slot.id)
@@ -463,7 +471,7 @@ class ClaudeRuntime:
         )
         for text in notices:
             await self._emit("claude_notice", {"level": "info", "text": text}, slot_id=slot.id)
-        await self.push_status()
+        await self.push_status(include_transcript=True)
 
     async def start(self, resume: str | None = None) -> None:
         slot = self._ensure_viewed_meta()
@@ -844,14 +852,14 @@ class ClaudeRuntime:
         self.slots[slot.id] = slot
         self._apply_slot_to_viewed(slot)
         await self._start_slot_process(slot, resume=None)
-        await self.push_status()
+        await self.push_status(include_transcript=True)
 
     async def open_session(self, session_id: str) -> None:
         sid = (session_id or "").strip()
         if not sid:
             return
         if sid == self.viewed_id:
-            await self.push_status()
+            await self.push_status(include_transcript=True)
             return
         meta = self.store.get(sid)
         if meta is None:
@@ -864,13 +872,13 @@ class ClaudeRuntime:
                 id=meta.id,
                 workspace=Path(meta.workspace) if meta.workspace else self.workspace,
                 session_id=meta.native_id or None,
+                persisted_native_id=meta.native_id or "",
             )
             self.slots[sid] = slot
         self._apply_slot_to_viewed(slot)
         if not self._slot_alive(slot):
             await self._start_slot_process(slot, resume=slot.session_id or meta.native_id or None)
-        else:
-            await self.push_status()
+        await self.push_status(include_transcript=True)
 
     async def delete_session(self, session_id: str) -> None:
         sid = (session_id or "").strip()
@@ -1138,13 +1146,17 @@ class ClaudeRuntime:
             return
         kind = str(message.get("type") or "")
         if message.get("session_id"):
-            slot.session_id = str(message["session_id"])
+            native = str(message["session_id"])
+            slot.session_id = native
             if sid == self.viewed_id:
-                self.session_id = slot.session_id
-            try:
-                self.store.touch(sid, native_id=slot.session_id)
-            except Exception:  # noqa: BLE001
-                pass
+                self.session_id = native
+            # Sync disk only on change — every stream line used to rewrite meta.json.
+            if native and native != slot.persisted_native_id:
+                slot.persisted_native_id = native
+                try:
+                    self.store.touch(sid, native_id=native)
+                except Exception:  # noqa: BLE001
+                    pass
 
         if kind == "stream_event":
             await self._dispatch_stream_event(message, slot=slot)
@@ -1296,10 +1308,10 @@ class ClaudeRuntime:
         if etype == "content_block_delta":
             delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
             dtype = str(delta.get("type") or "")
+            # Activity already set on content_block_start — do not dual-emit per delta.
             if dtype in {"thinking_delta", "thinking"} or delta.get("thinking"):
                 text = str(delta.get("thinking") or delta.get("text") or "")
                 if text:
-                    await self._emit("claude_activity", {"text": "思考中…", "kind": "thinking"}, slot_id=sid)
                     await self._emit("claude_thinking", {"delta": text}, slot_id=sid)
                 return
             if dtype in {"text_delta", "text"} or delta.get("text"):
@@ -1308,7 +1320,6 @@ class ClaudeRuntime:
                     slot.buffer += text
                     if sid == self.viewed_id:
                         self._buffer = slot.buffer
-                    await self._emit("claude_activity", {"text": "回答中…", "kind": "streaming"}, slot_id=sid)
                     await self._emit("claude_text", {"delta": text}, slot_id=sid)
                 return
             return

@@ -66,6 +66,8 @@ class GuiServer:
             "/attachment/{session_id}/{filename}", self._attachment
         )
         app.router.add_get("/workspace-file", self._workspace_file)
+        # Block donate QR assets before the static catch-all (even if present locally).
+        app.router.add_get("/static/donate/{name}", self._donate_static)
         if WEB_ROOT.is_dir():
             app.router.add_static("/static", WEB_ROOT, name="static")
         return app
@@ -93,6 +95,21 @@ class GuiServer:
             self._runner = None
 
     # -- routes -----------------------------------------------------------
+
+    async def _donate_static(self, request: web.Request) -> web.StreamResponse:
+        """Serve donate assets only when support UI is explicitly enabled."""
+        from ..support import SUPPORT_UI_ENABLED
+
+        if not SUPPORT_UI_ENABLED:
+            return web.Response(status=404, text="not found")
+        name = Path(str(request.match_info.get("name") or "")).name
+        if not name or name.startswith("."):
+            return web.Response(status=400, text="bad path")
+        path = (WEB_ROOT / "donate" / name).resolve()
+        donate_root = (WEB_ROOT / "donate").resolve()
+        if not str(path).startswith(str(donate_root)) or not path.is_file():
+            return web.Response(status=404, text="not found")
+        return web.FileResponse(path)
 
     async def _health(self, request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "protocol": PROTOCOL_VERSION})

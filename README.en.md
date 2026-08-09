@@ -92,4 +92,4 @@ python packaging/build.py --clean --installer
 
 ## Security
 
-Before committing, ensure `.env`, secrets, local `config.yaml`, and payment QR images are not tracked. See [`SECURITY.md`](SECURITY.md) to report vulnerabilities.
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md).

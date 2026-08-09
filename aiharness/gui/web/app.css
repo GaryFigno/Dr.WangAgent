@@ -687,6 +687,17 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; }
   white-space: nowrap;
   padding: 0;
 }
+.todo-continue-btn {
+  flex-shrink: 0;
+  min-width: 72px;
+  padding: 4px 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.todo-continue-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 
 .edit-review {
   border-top: 1px solid var(--line);

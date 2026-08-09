@@ -444,8 +444,8 @@ class GuiSession:
         await self.push_all()
         await self.push_edit_review()
         await self.push_pending_hitl()
-        await self.codex.push_status()
-        await self.claude.push_status()
+        await self.codex.push_status(include_transcript=True)
+        await self.claude.push_status(include_transcript=True)
         viewed = self.session.meta.id
         live = self.live.get(viewed)
         if live is not None and live.last_activity:
@@ -834,6 +834,10 @@ class GuiSession:
         from ..support import public_support
 
         data = public_support()
+        if not data.get("enabled"):
+            data["alipay_available"] = False
+            data["wechat_available"] = False
+            return data
         donate_dir = Path(__file__).parent / "web" / "donate"
         alipay_name = Path(str(data.get("alipay_qr") or "")).name or "alipay.png"
         wechat_name = Path(str(data.get("wechat_qr") or "")).name or "wechat.png"

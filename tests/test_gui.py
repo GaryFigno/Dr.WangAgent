@@ -1779,6 +1779,12 @@ async def test_continue_work_starts_turn_from_open_todos(gui, sent, fake):
     assert gui._turn_task is not None
     await gui._turn_task
     assert any(m.get("type") == "turn_start" for m in sent)
+    # Continue must not re-classify (avoids AskUser park after "例行任务").
+    assert not any(
+        "例行" in str(m.get("text") or "") or "Project" in str(m.get("text") or "")
+        for m in sent
+        if m.get("type") == "notice"
+    )
     await gui.close()
 
 

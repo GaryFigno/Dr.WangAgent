@@ -452,11 +452,26 @@ const HANDLERS = {
       setPet("error");
       return;
     }
+    // Busy rejection after optimistic Send/Continue — surface it and unstick UI.
+    if (
+      msg.level === "warn"
+      && /仍在运行|Still working|実行中|请先打断|interrupt first/i.test(text)
+    ) {
+      toast(text, "warn");
+      send("refresh", {});
+      return;
+    }
     if (
       msg.level === "warn"
       && /看图|图片|vision|image|retry|重试|网络|timeout|timed out|可见文字|no visible answer|見える回答/i.test(text)
     ) {
       toast(text, "warn");
+    }
+    if (
+      msg.level === "info"
+      && /继续未完成|Continuing unfinished|未完了タスクを続行|没有未完成|No open todos|未完了のタスクはありません/i.test(text)
+    ) {
+      toast(text, "ok");
     }
   },
 
@@ -2109,6 +2124,10 @@ function applyStatus(status) {
   $("interrupt").disabled = !status.busy;
   if (wasBusy && !status.busy) setTimeout(flushPromptQueue, 0);
   renderPromptQueue();
+  // Continue visibility tracks busy — refresh the strip when it flips.
+  if (wasBusy !== status.busy && state.lastTodos && state.lastTodos.length) {
+    renderTodos(state.lastTodos);
+  }
   $("plan-badge").classList.toggle("hidden", !status.plan_mode);
   $("plan-badge").classList.toggle("clickable", !!status.plan_mode);
   const exploreBadge = $("explore-badge");
@@ -2314,6 +2333,11 @@ function clearPanelTranscriptDom(mode) {
   }
 }
 
+function panelTranscriptIsEmpty(mode) {
+  const host = panelTranscript(mode);
+  return !host || host.children.length === 0;
+}
+
 function replayPanelTranscript(mode, rows) {
   clearPanelTranscriptDom(mode);
   const host = panelTranscript(mode);
@@ -2447,20 +2471,22 @@ function sessionRow(meta, group) {
     if (prefix === "codex") {
       if (id && id !== state.viewCodexSessionId) {
         state.viewCodexSessionId = id;
-        state.codexReplayPending = true;
         clearPanelTranscriptDom("codex");
         clearPanelActivity("codex");
       }
+      // Always request a replay — same-session clicks used to skip when the
+      // panel was empty after a status-without-transcript race.
+      state.codexReplayPending = true;
       send("codex_open_session", { id });
       return;
     }
     if (prefix === "claude") {
       if (id && id !== state.viewClaudeSessionId) {
         state.viewClaudeSessionId = id;
-        state.claudeReplayPending = true;
         clearPanelTranscriptDom("claude");
         clearPanelActivity("claude");
       }
+      state.claudeReplayPending = true;
       send("claude_open_session", { id });
       return;
     }
@@ -2668,59 +2694,7 @@ function renderAboutSupport(config) {
 }
 
 function showSupportModal() {
-  const support = (state.config && state.config.support) || {};
-  const links = support.links || [];
-  openModal(t("settings.supportTitle"), (body) => {
-    body.appendChild(el("p", "hint", t("settings.supportBody")));
-    const bar = el("div", "support-links");
-    if (!links.length) {
-      body.appendChild(el("p", "hint", t("settings.supportNoLinks")));
-    }
-    for (const link of links) {
-      const button = el("button", "primary-button",
-        link.id === "github_sponsors" ? t("settings.supportGithub") : (link.label || link.url));
-      button.type = "button";
-      button.onclick = () => send("open_url", { url: link.url });
-      bar.appendChild(button);
-    }
-    if (links.length) body.appendChild(bar);
-
-    body.appendChild(el("p", "hint", t("settings.supportQrHint")));
-    const row = el("div", "support-qr-row");
-    const qrs = [
-      {
-        title: t("settings.supportAlipay"),
-        available: !!support.alipay_available,
-        src: support.alipay_qr,
-        alt: "Alipay",
-        missing: t("settings.supportAlipayMissing"),
-      },
-      {
-        title: t("settings.supportWechat"),
-        available: !!support.wechat_available,
-        src: support.wechat_qr,
-        alt: "WeChat",
-        missing: t("settings.supportWechatMissing"),
-      },
-    ];
-    for (const item of qrs) {
-      const card = el("div", "support-qr-card");
-      card.appendChild(el("div", "section-label", item.title));
-      if (item.available && item.src) {
-        const img = document.createElement("img");
-        img.className = "support-qr";
-        img.alt = item.alt;
-        img.src = item.src;
-        card.appendChild(img);
-      } else {
-        card.appendChild(el("p", "hint", item.missing));
-      }
-      row.appendChild(card);
-    }
-    body.appendChild(row);
-  }, [
-    { label: t("settings.supportClose"), run: () => {} },
-  ]);
+  // Support / donate UI is intentionally disabled (no Sponsors / QR exposure).
 }
 
 function roleDisplayName(role) {
@@ -3225,11 +3199,12 @@ function renderTodos(todos) {
   summary.onclick = () => toggle.click();
   head.append(toggle, summary);
   const openCount = state.lastTodos.filter((item) => item.status !== "completed").length;
-  if (openCount && !(state.status && state.status.busy)) {
-    const cont = el("button", "ghost-button", t("todo.continue"));
+  if (openCount) {
+    const cont = el("button", "primary-button todo-continue-btn", t("todo.continue"));
     cont.type = "button";
     cont.title = t("todo.continueTitle");
-    cont.onclick = () => send("continue_work", {});
+    cont.disabled = !!state.busy;
+    cont.onclick = () => requestContinueWork();
     head.appendChild(cont);
   }
   strip.appendChild(head);
@@ -4137,6 +4112,24 @@ function dispatchPrompt(text, images, refs, shown) {
   }
 }
 
+function requestContinueWork() {
+  if (state.busy) {
+    toast(t("toast.busy"), "warn");
+    return;
+  }
+  if (!send("continue_work", {})) {
+    setConnBanner("error", t("conn.retrying"));
+    toast(t("conn.offlineSend"), "warn");
+    return;
+  }
+  // Optimistic busy until status/turn_start arrives (same as Send).
+  state.busy = true;
+  $("send").textContent = t("composer.queue");
+  $("interrupt").disabled = false;
+  setActivity(t("activity.sending"), "pending");
+  if (state.lastTodos && state.lastTodos.length) renderTodos(state.lastTodos);
+}
+
 function submitPrompt() {
   const box = $("prompt");
   const text = box.value.trim();
@@ -4206,11 +4199,29 @@ function setUiMode(mode) {
   if (state.uiMode === "codex") {
     applyCodexStatus(state.codex);
     if (state.codex.sessions) renderSessions(state.codex.sessions);
+    if (panelTranscriptIsEmpty("codex")) {
+      const id = state.viewCodexSessionId
+        || (state.codex && (state.codex.viewed_id || state.codex.panel_session_id))
+        || "";
+      if (id) {
+        state.codexReplayPending = true;
+        send("codex_open_session", { id });
+      }
+    }
     const box = $("codex-prompt");
     if (box) box.focus();
   } else if (state.uiMode === "claude") {
     applyClaudeStatus(state.claude);
     if (state.claude.sessions) renderSessions(state.claude.sessions);
+    if (panelTranscriptIsEmpty("claude")) {
+      const id = state.viewClaudeSessionId
+        || (state.claude && (state.claude.viewed_id || state.claude.panel_session_id))
+        || "";
+      if (id) {
+        state.claudeReplayPending = true;
+        send("claude_open_session", { id });
+      }
+    }
     const box = $("claude-prompt");
     if (box) box.focus();
   } else {
@@ -4389,10 +4400,16 @@ function applyCodexStatus(msg) {
     renderSessions(state.codex.sessions);
   }
   const nextView = state.viewCodexSessionId;
+  // Replay when the view changed, the UI asked for it, or the panel is still
+  // blank (status-without-transcript can set viewed_id before history arrives).
   if (
     Array.isArray(msg.transcript)
     && nextView
-    && (nextView !== prevView || state.codexReplayPending)
+    && (
+      nextView !== prevView
+      || state.codexReplayPending
+      || panelTranscriptIsEmpty("codex")
+    )
   ) {
     state.codexReplayPending = false;
     replayPanelTranscript("codex", msg.transcript);
@@ -4512,10 +4529,16 @@ function applyClaudeStatus(msg) {
     renderSessions(state.claude.sessions);
   }
   const nextView = state.viewClaudeSessionId;
+  // Replay when the view changed, the UI asked for it, or the panel is still
+  // blank (status-without-transcript can set viewed_id before history arrives).
   if (
     Array.isArray(msg.transcript)
     && nextView
-    && (nextView !== prevView || state.claudeReplayPending)
+    && (
+      nextView !== prevView
+      || state.claudeReplayPending
+      || panelTranscriptIsEmpty("claude")
+    )
   ) {
     state.claudeReplayPending = false;
     replayPanelTranscript("claude", msg.transcript);
@@ -4747,10 +4770,13 @@ function setPanelActivity(mode, text, kind) {
   if (!row) {
     row = el("div", `activity ${kind || "busy"}`, text);
     dock.appendChild(row);
-  } else {
-    row.className = `activity ${kind || "busy"}`;
-    row.textContent = text;
+    return;
   }
+  // Skip no-op updates — stream used to rewrite identical "回答中…" thousands of times.
+  const nextKind = kind || "busy";
+  if (row.textContent === text && row.className === `activity ${nextKind}`) return;
+  row.className = `activity ${nextKind}`;
+  row.textContent = text;
 }
 
 function clearPanelActivity(mode) {
@@ -4844,21 +4870,35 @@ function appendPanelThinking(mode, delta) {
   if (!delta) return;
   const host = panelTranscript(mode);
   if (!host) return;
-  const key = mode === "claude" ? "claudeThinking" : "codexThinking";
-  let box = state[key];
+  const boxKey = mode === "claude" ? "claudeThinking" : "codexThinking";
+  const bufKey = mode === "claude" ? "claudeThinkingBuf" : "codexThinkingBuf";
+  const frameKey = mode === "claude" ? "claudeThinkingFrame" : "codexThinkingFrame";
+  state[bufKey] = (state[bufKey] || "") + delta;
+  let box = state[boxKey];
   if (!box || !host.contains(box)) {
-    box = el("div", "entry thinking");
+    box = el("div", "entry thinking collapsed");
     const head = el("div", "thinking-head");
     head.append(el("span", "thinking-glyph", "›"), el("span", "thinking-label", "thinking"));
     const body = el("div", "thinking-body");
     head.onclick = () => box.classList.toggle("collapsed");
     box.append(head, body);
     host.appendChild(box);
-    state[key] = box;
+    state[boxKey] = box;
   }
-  const body = box.querySelector(".thinking-body");
-  if (body) body.textContent = (body.textContent || "") + delta;
-  host.scrollTop = host.scrollHeight;
+  if (state[frameKey]) return;
+  state[frameKey] = requestAnimationFrame(() => {
+    state[frameKey] = 0;
+    const live = state[boxKey];
+    const body = live && live.querySelector(".thinking-body");
+    if (body) body.textContent = state[bufKey] || "";
+    if (host && atPanelBottom(mode)) host.scrollTop = host.scrollHeight;
+  });
+}
+
+function atPanelBottom(mode) {
+  const host = panelTranscript(mode);
+  if (!host) return true;
+  return host.scrollHeight - host.scrollTop - host.clientHeight < 80;
 }
 
 function addCodexEntry(kind, text) {
@@ -4883,19 +4923,29 @@ function appendCodexText(delta) {
     node.textContent = state.codexBuffer;
     host.appendChild(node);
     state.codexStreaming = node;
-  } else {
-    state.codexStreaming.textContent = state.codexBuffer;
   }
-  host.scrollTop = host.scrollHeight;
+  if (state.codexStreamFrame) return;
+  state.codexStreamFrame = requestAnimationFrame(() => {
+    state.codexStreamFrame = 0;
+    if (state.codexStreaming) {
+      state.codexStreaming.textContent = state.codexBuffer;
+      if (atPanelBottom("codex")) host.scrollTop = host.scrollHeight;
+    }
+  });
 }
 
 function finishCodexStream() {
+  if (state.codexStreamFrame) {
+    cancelAnimationFrame(state.codexStreamFrame);
+    state.codexStreamFrame = 0;
+  }
   if (state.codexStreaming && state.codexBuffer) {
     state.codexStreaming.innerHTML = renderMarkdown(state.codexBuffer);
   }
   state.codexStreaming = null;
   state.codexBuffer = "";
   state.codexThinking = null;
+  state.codexThinkingBuf = "";
 }
 
 function submitCodexPrompt() {
@@ -4967,19 +5017,29 @@ function appendClaudeText(delta) {
     node.textContent = state.claudeBuffer;
     host.appendChild(node);
     state.claudeStreaming = node;
-  } else {
-    state.claudeStreaming.textContent = state.claudeBuffer;
   }
-  host.scrollTop = host.scrollHeight;
+  if (state.claudeStreamFrame) return;
+  state.claudeStreamFrame = requestAnimationFrame(() => {
+    state.claudeStreamFrame = 0;
+    if (state.claudeStreaming) {
+      state.claudeStreaming.textContent = state.claudeBuffer;
+      if (atPanelBottom("claude")) host.scrollTop = host.scrollHeight;
+    }
+  });
 }
 
 function finishClaudeStream() {
+  if (state.claudeStreamFrame) {
+    cancelAnimationFrame(state.claudeStreamFrame);
+    state.claudeStreamFrame = 0;
+  }
   if (state.claudeStreaming && state.claudeBuffer) {
     state.claudeStreaming.innerHTML = renderMarkdown(state.claudeBuffer);
   }
   state.claudeStreaming = null;
   state.claudeBuffer = "";
   state.claudeThinking = null;
+  state.claudeThinkingBuf = "";
 }
 
 function submitClaudePrompt() {
@@ -5402,8 +5462,6 @@ function wire() {
   addEventListener("resize", syncPanelWidth);
   syncPanelWidth();
   $("save-config").onclick = () => send("save_config", {});
-  const openSupport = $("open-support");
-  if (openSupport) openSupport.onclick = () => showSupportModal();
   const saveRule = $("save-rule");
   if (saveRule) {
     saveRule.onclick = () => send("save_rule", {
