@@ -597,6 +597,20 @@ def _classifier_binding(session: GuiSession):
     return None
 
 
+def _should_ask_classifier_questions(session: GuiSession, verdict: Any) -> bool:
+    """Whether classification may park on AskUser before the real turn."""
+    planning = session.config.planning
+    if not (verdict.needs_clarification and planning.ask_when_unclear):
+        return False
+    if session.permissions.mode == "yolo":
+        return False
+    # Score notice for 常规任务/小问题 must continue into the answer; classifiers
+    # often invent optional questions that stranded the GUI after the notice.
+    if not verdict.needs_plan:
+        return False
+    return True
+
+
 async def _route_by_complexity(
     session: GuiSession, text: str, *, agent: Any = None
 ) -> str:
@@ -639,7 +653,10 @@ async def _route_by_complexity(
         session_id=sid,
     )
 
-    if verdict.needs_clarification and planning.ask_when_unclear:
+    # Clarifying parks used to fire after the score notice and look like the
+    # turn died ("常规任务 3/10" then silence). Only interrupt for project-sized
+    # work in ask/auto — yolo means never ask, and routine tasks should just run.
+    if _should_ask_classifier_questions(session, verdict):
         answers = await session._ask_questions(verdict.questions, session_id=sid)
         if answers:
             rendered = "\n".join(f"- {k}: {v}" for k, v in answers.items())

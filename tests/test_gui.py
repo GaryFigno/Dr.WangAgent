@@ -703,6 +703,52 @@ async def test_auto_classify_toggle_persists(gui, sent, tmp_path, monkeypatch):
     await gui.close()
 
 
+async def test_simple_classify_with_questions_still_answers(gui, sent, fake):
+    """Routine score + invented questions must not park before the real reply."""
+    from .fake_openai import Reply
+
+    gui.config.planning.auto_classify = True
+    gui.config.planning.ask_when_unclear = True
+    fake.push(
+        Reply(
+            text=json.dumps(
+                {
+                    "score": 3,
+                    "reason": "写朋友圈文案，目标明确",
+                    "questions": [
+                        {
+                            "question": "偏正式还是口语？",
+                            "header": "语气",
+                            "options": [
+                                {"label": "正式", "description": "偏公文"},
+                                {"label": "口语", "description": "朋友圈风"},
+                            ],
+                        }
+                    ],
+                }
+            )
+        ),
+        Reply(text="【朋友圈文案】一键切换 Codex / Claude，CLI 看得见。"),
+    )
+    await gui_commands.dispatch(
+        gui,
+        Inbound.PROMPT,
+        {"text": "我要怎么在朋友圈里面宣传我们的软件？"},
+    )
+    assert gui._turn_task is not None
+    await gui._turn_task
+    assert not any(m.get("type") == "ask" for m in sent), sent
+    notices = [m.get("text", "") for m in sent if m.get("type") == "notice"]
+    assert any("常规任务" in text and "3/10" in text for text in notices)
+    texts = [
+        m.get("delta") or m.get("text") or ""
+        for m in sent
+        if m.get("type") in {"text", "done"}
+    ]
+    assert any("朋友圈文案" in text for text in texts)
+    await gui.close()
+
+
 async def test_set_draft_is_returned_on_status(gui, sent, tmp_path):
     from aiharness.gui.drafts import DraftStore
 

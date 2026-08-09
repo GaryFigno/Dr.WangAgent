@@ -459,7 +459,9 @@ async def test_clarifying_answers_are_appended_to_the_prompt(config, workspace, 
     from aiharness.ui.app import HarnessApp
 
     config.planning.auto_classify = True
+    config.permissions.mode = "ask"
     app = HarnessApp(config, workspace)
+    app.permissions.set_mode("ask")
 
     async def answer(questions):
         return {"Database": "Postgres"}
@@ -468,8 +470,9 @@ async def test_clarifying_answers_are_appended_to_the_prompt(config, workspace, 
         Reply(
             text=json.dumps(
                 {
-                    "score": 3,
-                    "reason": "needs a choice",
+                    # Project-sized only — routine scores no longer park on Ask.
+                    "score": 9,
+                    "reason": "new persistence subsystem",
                     "questions": [
                         {
                             "question": "Which database?",
@@ -488,7 +491,7 @@ async def test_clarifying_answers_are_appended_to_the_prompt(config, workspace, 
     async with app.run_test() as pilot:
         await pilot.pause()
         app._ask_user = answer  # bypass the modal
-        app.query_one("#prompt").value = "add persistence"
+        app.query_one("#prompt").value = "rewrite the persistence layer"
         await pilot.press("enter")
         await pilot.pause(delay=1.5)
 

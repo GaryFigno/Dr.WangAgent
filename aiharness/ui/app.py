@@ -475,7 +475,14 @@ class HarnessApp(App[None]):
             + (f" — {verdict.reason}" if verdict.reason else "")
         )
 
-        if verdict.needs_clarification and planning.ask_when_unclear:
+        # Match GUI: do not park after a routine score notice; yolo never asks.
+        ask_ok = (
+            verdict.needs_clarification
+            and planning.ask_when_unclear
+            and verdict.needs_plan
+            and self.permissions.mode != "yolo"
+        )
+        if ask_ok:
             answers = await self._ask_user(verdict.questions)
             if answers:
                 rendered = "\n".join(f"- {k}: {v}" for k, v in answers.items())
