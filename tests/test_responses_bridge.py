@@ -10,11 +10,15 @@ from aiohttp import web
 
 from aiharness.gui.responses_bridge import (
     CLIENT_MAX_BODY_BYTES,
+    UPSTREAM_BODY_SOFT_LIMIT,
     ResponsesBridge,
+    _json_utf8_size,
     _norm_upstream,
+    format_upstream_error,
     needs_responses_bridge,
     responses_body_to_chat,
     responses_input_to_messages,
+    shrink_chat_body,
 )
 
 
@@ -28,6 +32,31 @@ def test_needs_responses_bridge_kimi_coding():
 def test_bridge_does_not_cap_request_bodies():
     # Passthrough: match CLI — no artificial 1 MiB aiohttp default.
     assert CLIENT_MAX_BODY_BYTES == 0
+
+
+def test_format_upstream_error_humanizes_nginx_413():
+    html = (
+        "<html><head><title>413 Request Entity Too Large</title></head>"
+        "<body><center><h1>413 Request Entity Too Large</h1></center></body></html>"
+    )
+    tip = format_upstream_error(413, html)
+    assert "请求体过大" in tip
+    assert "<html" not in tip
+
+
+def test_shrink_chat_body_fits_under_soft_limit():
+    huge = "x" * 200_000
+    messages = [{"role": "system", "content": "sys"}]
+    for i in range(6):
+        messages.append({"role": "user", "content": f"turn {i}"})
+        messages.append({"role": "assistant", "content": "ok"})
+        messages.append({"role": "tool", "tool_call_id": f"c{i}", "content": huge})
+    messages.append({"role": "user", "content": "continue please"})
+    chat = {"model": "k3", "stream": True, "messages": messages}
+    assert _json_utf8_size(chat) > UPSTREAM_BODY_SOFT_LIMIT
+    shrunk = shrink_chat_body(chat, max_bytes=80_000)
+    assert _json_utf8_size(shrunk) <= 80_000
+    assert shrunk["messages"][-1]["content"] == "continue please"
 
 
 def test_norm_upstream_adds_v1_for_kimi_coding():

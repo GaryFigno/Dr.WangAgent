@@ -25,6 +25,9 @@ HOST = "127.0.0.1"
 #: aiohttp defaults to 1 MiB which invents a limit the real CLI does not have.
 #: 0 = unlimited — we are a passthrough, not a size gate.
 CLIENT_MAX_BODY_BYTES = 0
+#: Kimi Coding (and its nginx) often 413 around 1 MiB. Shrink tool-heavy
+#: Codex histories before upload so long sessions keep working.
+UPSTREAM_BODY_SOFT_LIMIT = 700_000
 
 
 def needs_responses_bridge(base_url: str) -> bool:
@@ -246,6 +249,124 @@ def sanitize_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
             continue
         cleaned.append(item)
     return cleaned or [{"role": "user", "content": ""}]
+
+
+def _json_utf8_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _truncate_middle(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    marker = "\n…[truncated]…\n"
+    budget = max(32, limit - len(marker))
+    head = budget // 2
+    tail = budget - head
+    return text[:head] + marker + text[-tail:]
+
+
+def shrink_chat_body(
+    chat: dict[str, Any],
+    *,
+    max_bytes: int = UPSTREAM_BODY_SOFT_LIMIT,
+) -> dict[str, Any]:
+    """Trim tool outputs / old turns so upstream nginx does not 413.
+
+    Prefer truncating ``tool`` payloads first (usually the bulk of Codex
+    history), then drop the oldest non-system turns. Always keep the last
+    user message so the current request survives.
+    """
+    if _json_utf8_size(chat) <= max_bytes:
+        return chat
+
+    import copy
+
+    out = copy.deepcopy(chat)
+    messages = list(out.get("messages") or [])
+    if not messages:
+        return out
+
+    def _fit() -> bool:
+        out["messages"] = messages
+        return _json_utf8_size(out) <= max_bytes
+
+    # Pass 1: squash oversized tool / assistant strings.
+    for limit in (12_000, 4_000, 1_200, 400, 120):
+        if _fit():
+            return out
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and len(content) > limit:
+                if message.get("role") in {"tool", "assistant", "user"}:
+                    # Never gut the latest user turn on the first passes.
+                    if message is messages[-1] and message.get("role") == "user":
+                        continue
+                    message["content"] = _truncate_middle(content, limit)
+            tool_calls = message.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    args = fn.get("arguments")
+                    if isinstance(args, str) and len(args) > limit:
+                        fn["arguments"] = _truncate_middle(args, limit)
+
+    if _fit():
+        return out
+
+    # Pass 2: drop oldest turns after system prompts (keep the tail).
+    while len(messages) > 2 and not _fit():
+        drop_at = 0
+        while drop_at < len(messages) - 1 and messages[drop_at].get("role") == "system":
+            drop_at += 1
+        if drop_at >= len(messages) - 1:
+            break
+        messages.pop(drop_at)
+
+    # Last resort: hard-trim the final user message.
+    if not _fit() and messages:
+        last = messages[-1]
+        content = last.get("content")
+        if isinstance(content, str) and len(content) > 2_000:
+            last["content"] = _truncate_middle(content, 2_000)
+        out["messages"] = messages
+    return out
+
+
+def format_upstream_error(status: int, body: str) -> str:
+    """Turn nginx / provider HTML into a short actionable message."""
+    text = (body or "").strip()
+    lowered = text.lower()
+    if (
+        status == 413
+        or "request entity too large" in lowered
+        or "413" in text[:80]
+    ):
+        return (
+            "请求体过大（会话上下文太长，常见于工具输出很多之后）。"
+            "已尝试自动压缩历史；若仍失败请新开一个 Codex 会话继续。"
+        )
+    # Prefer JSON error.message when present.
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            err = parsed.get("error")
+            if isinstance(err, dict) and err.get("message"):
+                return str(err["message"])[:400]
+            if parsed.get("message"):
+                return str(parsed["message"])[:400]
+    except json.JSONDecodeError:
+        pass
+    if "<html" in lowered:
+        return f"上游 HTTP {status}（返回了网页错误页，而非 JSON）"
+    return f"upstream {status}: {text[:300]}"
 
 
 def responses_body_to_chat(body: dict[str, Any]) -> dict[str, Any]:
@@ -493,26 +614,52 @@ class ResponsesBridge:
             return web.json_response({"error": {"message": "object required"}}, status=400)
 
         chat_body = responses_body_to_chat(body)
+        raw_size = _json_utf8_size(chat_body)
+        if raw_size > UPSTREAM_BODY_SOFT_LIMIT:
+            log.info(
+                "ResponsesBridge shrinking chat body %s → ≤%s bytes",
+                raw_size,
+                UPSTREAM_BODY_SOFT_LIMIT,
+            )
+            chat_body = shrink_chat_body(chat_body)
         stream = bool(chat_body.get("stream"))
         headers = self._auth_headers(request)
         url = self._upstream_url("/chat/completions")
 
         if not stream:
             try:
-                async with self._session.post(
-                    url,
-                    json=chat_body,
-                    headers=headers,
-                    **self._proxy_kw(),
-                ) as resp:
-                    payload = await resp.json(content_type=None)
-                    if resp.status >= 400:
-                        return web.json_response(payload if isinstance(payload, dict) else {"error": payload}, status=resp.status)
-                    if not isinstance(payload, dict):
-                        return web.json_response({"error": {"message": "bad upstream"}}, status=502)
-                    return web.json_response(
-                        chat_completion_to_response(payload, model=str(chat_body.get("model") or ""))
-                    )
+                payload_body = chat_body
+                for attempt in range(2):
+                    async with self._session.post(
+                        url,
+                        json=payload_body,
+                        headers=headers,
+                        **self._proxy_kw(),
+                    ) as resp:
+                        if resp.status == 413 and attempt == 0:
+                            payload_body = shrink_chat_body(
+                                payload_body,
+                                max_bytes=max(200_000, UPSTREAM_BODY_SOFT_LIMIT // 2),
+                            )
+                            log.info("ResponsesBridge 413 — retrying with tighter body")
+                            continue
+                        if resp.status >= 400:
+                            err_text = await resp.text()
+                            tip = format_upstream_error(resp.status, err_text)
+                            self.last_error = tip
+                            return web.json_response(
+                                {"error": {"message": tip}}, status=resp.status
+                            )
+                        payload = await resp.json(content_type=None)
+                        if not isinstance(payload, dict):
+                            return web.json_response(
+                                {"error": {"message": "bad upstream"}}, status=502
+                            )
+                        return web.json_response(
+                            chat_completion_to_response(
+                                payload, model=str(payload_body.get("model") or "")
+                            )
+                        )
             except Exception as error:  # noqa: BLE001
                 log.warning("ResponsesBridge non-stream failed: %s", error)
                 return web.json_response({"error": {"message": str(error)}}, status=502)
@@ -589,19 +736,28 @@ class ResponsesBridge:
         text_parts: list[str] = []
         tool_acc: dict[int, dict[str, str]] = {}
         failed_message = ""
+        payload_body = chat_body
         try:
-            async with self._session.post(
-                url,
-                json=chat_body,
-                headers=headers,
-                **self._proxy_kw(),
-            ) as resp:
-                if resp.status >= 400:
-                    err_body = await resp.text()
-                    failed_message = f"upstream {resp.status}: {err_body[:500]}"
-                    log.warning("ResponsesBridge upstream error: %s", failed_message)
-                    self.last_error = failed_message
-                else:
+            for attempt in range(2):
+                async with self._session.post(
+                    url,
+                    json=payload_body,
+                    headers=headers,
+                    **self._proxy_kw(),
+                ) as resp:
+                    if resp.status == 413 and attempt == 0:
+                        payload_body = shrink_chat_body(
+                            payload_body,
+                            max_bytes=max(200_000, UPSTREAM_BODY_SOFT_LIMIT // 2),
+                        )
+                        log.info("ResponsesBridge stream 413 — retrying with tighter body")
+                        continue
+                    if resp.status >= 400:
+                        err_body = await resp.text()
+                        failed_message = format_upstream_error(resp.status, err_body)
+                        log.warning("ResponsesBridge upstream error: %s", failed_message)
+                        self.last_error = failed_message
+                        break
                     buffer = ""
                     async for raw in resp.content.iter_any():
                         if request.transport is None or request.transport.is_closing():
@@ -638,9 +794,11 @@ class ResponsesBridge:
                                     },
                                 )
                             )
+                    break
         except Exception as error:  # noqa: BLE001
             failed_message = str(error)
             log.warning("ResponsesBridge stream failed: %s", error)
+            self.last_error = failed_message
 
         if failed_message:
             await out.write(

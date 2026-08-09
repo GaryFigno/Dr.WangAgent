@@ -1399,9 +1399,10 @@ class CodexRuntime:
                     self._responses_bridge.last_error = ""
                     self.last_error = bridge_err
             if bridge_err:
+                tip = _codex_error_text({"message": bridge_err})
                 await self._emit(
                     "codex_error",
-                    {"message": f"模型接口错误：{bridge_err[:400]}"},
+                    {"message": f"模型接口错误：{tip}"},
                     slot_id=slot_id,
                 )
                 await self._emit("codex_done", {"ok": False}, slot_id=slot_id)
