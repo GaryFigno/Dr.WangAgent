@@ -445,6 +445,17 @@ const HANDLERS = {
     addNotice(msg.text, msg.level);
     const text = String(msg.text || "").trim();
     if (!text) return;
+    // Score notice is not the answer — keep the turn looking alive until tokens.
+    if (
+      msg.level === "info"
+      && /（\d+\s*\/\s*10）|\(\d+\s*\/\s*10\)/.test(text)
+      && /(小问题|常规任务|项目|Trivial|Simple|Project)/i.test(text)
+    ) {
+      state.busy = true;
+      $("send").textContent = t("composer.queue");
+      $("interrupt").disabled = false;
+      setActivity(modelActivityLabel(t("activity.thinking")), "thinking");
+    }
     // Provider / network failures must not hide in scrollback only.
     if (msg.level === "error") {
       toast(text, "error");

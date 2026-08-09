@@ -220,13 +220,10 @@ async def run_turn(
     session.live[turn_session_id] = live
     session.stream_session_id = turn_session_id
     try:
-        if not automatic:
-            text = await _route_by_complexity(session, text, agent=agent)
-        # Heal before the new user turn, same as Agent.run — otherwise an
-        # interrupted tool_calls tail lands after this message.
+        # Persist the user turn BEFORE classification. Scoring used to run first;
+        # if anything failed after the "小问题 (1/10)" notice, the chat stayed
+        # empty and looked like the turn died on the score line.
         agent.seal_unanswered_tool_calls()
-        # Persist the user turn before TURN_START so the sidebar shows the
-        # chat (and its title) while the model is still thinking.
         notice = agent.add_user_message(text, images=images)
         session.note_activity(
             turn_session_id,
@@ -252,6 +249,40 @@ async def run_turn(
         await session.push_status()
         if session.session.meta.id == turn_session_id:
             await session.push_context()
+
+        if not automatic:
+            try:
+                routed = await _route_by_complexity(session, text, agent=agent)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 — never strand after a score notice
+                await session.push(
+                    Outbound.NOTICE,
+                    level="warn",
+                    text=f"任务分类出错，改为直接回答：{type(error).__name__}: {error}",
+                    session_id=turn_session_id,
+                )
+                routed = text
+            # Clarifications / plan-mode notes are appended after the original
+            # user turn (jsonl is append-only).
+            if routed != text:
+                extra = routed[len(text) :].lstrip() if routed.startswith(text) else routed
+                if extra:
+                    from ..providers.base import Message
+
+                    agent._append(
+                        Message(
+                            role="user",
+                            content=extra,
+                            meta={"route_appendix": True},
+                        )
+                    )
+            await session.push(
+                Outbound.ACTIVITY,
+                text="正在生成回答…",
+                session_id=turn_session_id,
+            )
+
         async for event in agent.run(None):
             final = await _forward(session, event, session_id=turn_session_id) or final
     except asyncio.CancelledError:
@@ -275,6 +306,22 @@ async def run_turn(
                 session_id=turn_session_id,
             )
         raise
+    except Exception as error:  # noqa: BLE001 — surface instead of silent idle
+        agent.seal_unanswered_tool_calls()
+        if not live.done_sent:
+            live.done_sent = True
+            await session.push(
+                Outbound.NOTICE,
+                level="error",
+                text=f"{type(error).__name__}: {error}",
+                session_id=turn_session_id,
+            )
+            await session.push(
+                Outbound.DONE,
+                text=final,
+                interrupted=False,
+                session_id=turn_session_id,
+            )
     finally:
         agent.seal_unanswered_tool_calls()
         session.live.pop(turn_session_id, None)
@@ -652,6 +699,13 @@ async def _route_by_complexity(
         + (f" — {verdict.reason}" if verdict.reason else ""),
         session_id=sid,
     )
+    # Keep the dock alive across the gap between score notice and first token.
+    await session.push(
+        Outbound.ACTIVITY,
+        text="分类完成，正在生成回答…",
+        session_id=sid,
+    )
+    await session.push_status()
 
     # Clarifying parks used to fire after the score notice and look like the
     # turn died ("常规任务 3/10" then silence). Only interrupt for project-sized
