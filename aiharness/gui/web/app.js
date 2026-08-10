@@ -160,14 +160,33 @@ const state = {
   //: Session the user intends to view (set on click before status arrives).
   //: Stream events from the previous chat must not paint during this gap.
   viewSessionId: "",
+  //: Bumps on every Agent session switch / new chat (generation token).
+  viewGen: 0,
+  //: True after New Chat until status binds the real session id. While pending,
+  //: stream events are dropped and READY is stashed (may still be the previous
+  //: chat's in-flight transcript).
+  viewPending: false,
+  //: Stashed READY while viewPending — applied only if session_id matches bind.
+  pendingTranscript: null,
   //: Codex / Claude panel viewed session ids (optimistic, for stream filter).
   viewCodexSessionId: "",
   viewClaudeSessionId: "",
+  viewCodexPending: false,
+  viewClaudePending: false,
   codexReplayPending: false,
   claudeReplayPending: false,
   //: After open_session / new chat, the next transcript replay must land on
   //: the latest message (ignore prior scroll position of the previous chat).
   pinBottomOnReady: false,
+  //: Last sidebar structure key — used to patch running badges without rebuild.
+  sessionListStructure: "",
+  //: Latest user bubble — avoids scanning the whole transcript per delta.
+  lastUserEntry: null,
+  //: Turn id for the in-flight stream bubble (from turn_start / text).
+  streamTurnId: "",
+  //: Window into the full transcript (paged load-older).
+  transcriptOffset: 0,
+  transcriptTotal: 0,
   //: Ordered pending images for the next send (data URLs for thumbs).
   pendingImages: [],
   //: Prompts waiting while the open session is busy (editable guidance).
@@ -280,10 +299,14 @@ function flushPendingPrompt() {
 
 /** Stream / HITL events must not paint onto a chat the user is not viewing. */
 const SESSION_SCOPED = new Set([
+  "ready",
   "text", "thinking", "turn_start", "turn_end", "done",
   "tool_start", "tool_end", "activity", "compacted", "notice",
   "ask", "permission", "plan", "todos", "quest", "edit_review",
 ]);
+
+/** Page size for initial replay and "load older" requests. */
+const TRANSCRIPT_REPLAY_LIMIT = 80;
 
 /** Codex / Claude stream events scoped by panel_session_id. */
 const PANEL_SESSION_SCOPED = new Set([
@@ -295,11 +318,12 @@ const PANEL_SESSION_SCOPED = new Set([
 
 function forActiveSession(msg) {
   if (!msg || !msg.session_id || !SESSION_SCOPED.has(msg.type)) return true;
-  // Prefer the optimistic view id so a late "k3 思考中" from the previous
-  // chat cannot land after the user already clicked another session.
-  const id = state.viewSessionId
-    || (state.status && state.status.session_id)
-    || "";
+  // New Chat: drop streams until status binds. READY is stashed in its handler
+  // (must still reach handle — see ready()), so allow only that type through.
+  if (state.viewPending) return msg.type === "ready";
+  // Do NOT fall back to status.session_id — that re-bound New Chat to the
+  // previous session and let its deltas paint on the cleared pane.
+  const id = state.viewSessionId || "";
   return !id || msg.session_id === id;
 }
 
@@ -307,15 +331,16 @@ function forActivePanelSession(msg) {
   if (!msg || !PANEL_SESSION_SCOPED.has(msg.type)) return true;
   const pid = msg.panel_session_id || "";
   if (String(msg.type).startsWith("codex_")) {
+    // Empty view id used to admit every event — wrong after New Chat clear.
+    if (state.viewCodexPending) return false;
     const id = state.viewCodexSessionId
       || (state.codex && (state.codex.viewed_id || state.codex.panel_session_id))
       || "";
-    // Untagged stream events are dropped once a viewed session exists —
-    // otherwise an old singleton push could paint into the wrong chat.
     if (!id) return true;
     return !!pid && pid === id;
   }
   if (String(msg.type).startsWith("claude_")) {
+    if (state.viewClaudePending) return false;
     const id = state.viewClaudeSessionId
       || (state.claude && (state.claude.viewed_id || state.claude.panel_session_id))
       || "";
@@ -349,19 +374,50 @@ const HANDLERS = {
     // Only replay when the backend actually sent history (refresh / open).
     // Never clobber an in-flight stream — that made answers vanish until restart.
     // Session switches set pinBottomOnReady and abandon the previous stream view.
+    // Tagged READY (open/refresh) is filtered by forActiveSession; untagged
+    // connect handshake still reaches here with transcript=[].
     if (!Array.isArray(msg.transcript)) return;
+    const sid = msg.session_id || "";
+    // New Chat: stash until status binds the real id. Binding from READY alone
+    // can adopt a late READY from the previous open_session (serial pump race).
+    if (state.viewPending) {
+      if (sid) {
+        state.pendingTranscript = {
+          transcript: msg.transcript,
+          compactions: msg.compactions || [],
+          session_id: sid,
+          viewGen: state.viewGen,
+          transcript_offset: msg.transcript_offset,
+          transcript_total: msg.transcript_total,
+        };
+      }
+      return;
+    }
+    if (sid && state.viewSessionId && sid !== state.viewSessionId) return;
+    // Older page: prepend without wiping the live pane.
+    if (msg.replace === false) {
+      prependTranscript(msg.transcript || [], {
+        offset: msg.transcript_offset,
+        total: msg.transcript_total,
+      });
+      return;
+    }
     const switchIn = state.pinBottomOnReady;
     if (!switchIn && !msg.transcript.length) return;
-    if (!switchIn && (state.streaming || (state.busy && state.buffer))) {
+    if (!switchIn && (state.streaming || state.busy)) {
       return;
     }
     state.pinBottomOnReady = false;
-    replayTranscript(msg.transcript, msg.compactions || []);
+    replayTranscript(msg.transcript, msg.compactions || [], {
+      offset: msg.transcript_offset,
+      total: msg.transcript_total,
+    });
     scrollToLatest();
   },
 
   text(msg) {
     if (msg.delta) state.turnHadText = true;
+    if (msg.turn_id) state.streamTurnId = msg.turn_id;
     setActivity(
       modelActivityLabel(
         t("activity.answering"),
@@ -370,9 +426,10 @@ const HANDLERS = {
       ),
       "streaming",
     );
-    appendText(msg.delta);
+    appendText(msg.delta, msg.turn_id || state.streamTurnId || "");
   },
   thinking(msg) {
+    if (msg.turn_id) state.streamTurnId = msg.turn_id;
     setActivity(
       modelActivityLabel(
         t("activity.thinking"),
@@ -395,6 +452,7 @@ const HANDLERS = {
     setPet("thinking");
     state.turns += 1;
     state.turnHadText = false;
+    state.streamTurnId = msg.turn_id || "";
     state.turnRefs = Array.isArray(msg.refs) ? msg.refs.slice() : [];
     renderTurnRefs(state.turnRefs);
     renderWorkspaceChips();
@@ -406,11 +464,13 @@ const HANDLERS = {
   turn_end() { /* usage lands in the status message */ },
 
   done(msg) {
+    if (msg.turn_id) state.streamTurnId = msg.turn_id;
     finishStreaming();
     // If deltas were dropped (refresh wipe / reconnect), still paint final text.
-    ensureAssistantVisible(msg.text);
+    ensureAssistantVisible(msg.text, msg.turn_id || state.streamTurnId || "");
     foldPendingTools();
     clearActivity();
+    state.streamTurnId = "";
     const interrupted = !!msg.interrupted;
     const emptyText = !(msg.text || "").trim() && !state.turnHadText;
     setPet(interrupted ? "error" : emptyText ? "error" : "happy");
@@ -570,7 +630,7 @@ const HANDLERS = {
   compacted(msg) { addCompaction(msg); setPet("compact"); },
 
   status(msg) {
-    applyStatus(msg.status);
+    if (!applyStatus(msg.status)) return;
     if (msg.status && Array.isArray(msg.status.turn_refs)) {
       state.turnRefs = msg.status.turn_refs.slice();
       renderTurnRefs(state.turnRefs);
@@ -979,6 +1039,7 @@ function addUser(text, images, userIndex) {
   if (text) node.appendChild(el("div", "user-text", text));
   attachBubbleActions(node, text, userIndex);
   mount(node);
+  state.lastUserEntry = node;
 }
 
 function openImageViewer(src, title) {
@@ -1614,11 +1675,40 @@ function clearActivity(source) {
   state.activity = null;
 }
 
-function appendText(delta) {
+/** True when ``node`` is still after the latest user bubble (current turn). */
+function streamNodeAfterLastUser(host, node) {
+  if (!host || !node || !host.contains(node)) return false;
+  let lastUser = state.lastUserEntry;
+  if (!lastUser || !host.contains(lastUser)) {
+    const users = host.querySelectorAll(".entry.user");
+    lastUser = users.length ? users[users.length - 1] : null;
+    state.lastUserEntry = lastUser;
+  }
+  if (!lastUser) return true;
+  return !!(lastUser.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING);
+}
+
+function appendText(delta, turnId) {
+  const host = transcript();
+  const tid = turnId || state.streamTurnId || "";
+  if (
+    state.streaming
+    && tid
+    && state.streaming.dataset
+    && state.streaming.dataset.turnId
+    && state.streaming.dataset.turnId !== tid
+  ) {
+    finishStreaming();
+  }
+  if (state.streaming && host && !streamNodeAfterLastUser(host, state.streaming)) {
+    // Previous turn's bubble is still pointed at — seal it and start fresh.
+    finishStreaming();
+  }
   if (!state.streaming) {
     // Do not wipe buffer — a mid-turn transcript refresh may have dropped
     // the streaming node while deltas already lived in state.buffer.
     state.streaming = mount(el("div", "entry assistant"));
+    if (tid) state.streaming.dataset.turnId = tid;
   }
   state.buffer += delta;
   // Paint at most once per frame so rapid deltas don't thrash layout.
@@ -1749,11 +1839,28 @@ function addNotice(text, level) {
 }
 
 /** Guarantee the final answer is on screen even if stream bubbles were lost. */
-function ensureAssistantVisible(text) {
+function ensureAssistantVisible(text, turnId) {
   const body = String(text || "").trim();
   if (!body) return;
+  // Stream already painted this turn — never rewrite an earlier bubble.
+  if (state.turnHadText) return;
   const host = transcript();
   if (!host) return;
+  const tid = turnId || state.streamTurnId || "";
+  if (tid) {
+    const byTurn = [...host.querySelectorAll(".entry.assistant")].find(
+      (node) => node.dataset.turnId === tid
+    );
+    if (byTurn) {
+      if (!(byTurn.textContent || "").trim()) {
+        byTurn.innerHTML = renderMarkdown(body);
+        decorateCopyables(byTurn);
+        attachPinMemory(byTurn, body);
+      }
+      state.turnHadText = true;
+      return;
+    }
+  }
   let last = host.lastElementChild;
   // Skip trailing notices / activity hosts / edit chrome.
   while (
@@ -1766,19 +1873,18 @@ function ensureAssistantVisible(text) {
   ) {
     last = last.previousElementSibling;
   }
-  if (last && last.classList.contains("assistant")) {
-    const existing = (last.textContent || "").trim();
-    if (existing.length >= Math.min(40, body.length)) {
-      state.turnHadText = true;
-      return;
-    }
+  // Only fill an empty assistant shell; never overwrite a non-empty answer
+  // (that merged the new reply into the previous bubble).
+  if (last && last.classList.contains("assistant") && !(last.textContent || "").trim()) {
     last.innerHTML = renderMarkdown(body);
     decorateCopyables(last);
     attachPinMemory(last, body);
+    if (tid) last.dataset.turnId = tid;
     state.turnHadText = true;
     return;
   }
   const node = mount(el("div", "entry assistant"));
+  if (tid) node.dataset.turnId = tid;
   node.innerHTML = renderMarkdown(body);
   decorateCopyables(node);
   attachPinMemory(node, body);
@@ -2048,7 +2154,81 @@ function addCompaction(msg) {
   mount(box);
 }
 
-function replayTranscript(entries, compactions) {
+function renderLoadOlderBar() {
+  const host = transcript();
+  if (!host) return;
+  const existing = host.querySelector(".entry.load-older");
+  if (existing) existing.remove();
+  if (!(state.transcriptOffset > 0)) return;
+  const n = Math.min(TRANSCRIPT_REPLAY_LIMIT, state.transcriptOffset);
+  const bar = el("div", "entry notice info load-older");
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "linkish";
+  btn.textContent = t("session.loadOlder", { n });
+  btn.onclick = () => {
+    btn.disabled = true;
+    send("load_transcript", {
+      before: state.transcriptOffset,
+      limit: TRANSCRIPT_REPLAY_LIMIT,
+    });
+  };
+  bar.appendChild(btn);
+  host.insertBefore(bar, host.firstChild);
+}
+
+function mountTranscriptEntry(item, userIndex) {
+  if (item.role === "user") {
+    addUser(item.text, item.images || [], userIndex);
+    const node = state.lastUserEntry;
+    if (node && item.id) node.dataset.msgId = item.id;
+    return userIndex + 1;
+  }
+  const node = mount(el("div", "entry assistant"));
+  if (item.id) node.dataset.msgId = item.id;
+  node.innerHTML = renderMarkdown(item.text);
+  decorateCopyables(node);
+  return userIndex;
+}
+
+function prependTranscript(entries, page) {
+  const host = transcript();
+  if (!host || !Array.isArray(entries) || !entries.length) return;
+  const stickBottom = atBottom();
+  const prevHeight = host.scrollHeight;
+  const anchor = host.querySelector(".entry.load-older") || host.firstChild;
+  const frag = document.createDocumentFragment();
+  for (const item of entries) {
+    if (item.role === "user") {
+      const node = el("div", "entry user");
+      if (item.id) node.dataset.msgId = item.id;
+      const gallery = el("div", "user-images");
+      for (const image of item.images || []) {
+        const img = document.createElement("img");
+        img.src = authUrl(image.url || image.dataUrl || "");
+        img.alt = image.name || "image";
+        gallery.appendChild(img);
+      }
+      node.appendChild(gallery);
+      if (item.text) node.appendChild(el("div", "user-text", item.text));
+      frag.appendChild(node);
+    } else {
+      const node = el("div", "entry assistant");
+      if (item.id) node.dataset.msgId = item.id;
+      node.innerHTML = renderMarkdown(item.text || "");
+      decorateCopyables(node);
+      frag.appendChild(node);
+    }
+  }
+  host.insertBefore(frag, anchor);
+  if (page && page.offset != null) state.transcriptOffset = page.offset;
+  else state.transcriptOffset = Math.max(0, state.transcriptOffset - entries.length);
+  if (page && page.total != null) state.transcriptTotal = page.total;
+  renderLoadOlderBar();
+  if (!stickBottom) host.scrollTop = host.scrollHeight - prevHeight;
+}
+
+function replayTranscript(entries, compactions, page) {
   const host = transcript();
   host.innerHTML = "";
   // Reset scroll before rebuild so mount()'s sticky check starts from top=0
@@ -2061,50 +2241,87 @@ function replayTranscript(entries, compactions) {
   state.streaming = null;
   state.buffer = "";
   state.thinking = null;
+  state.lastUserEntry = null;
   clearInlineHitl();
   state.turns = entries.length;
   renderWorkspaceChips();
-  let userIndex = 0;
-  for (const item of entries) {
-    if (item.role === "user") addUser(item.text, item.images || [], userIndex++);
-    else {
-      const node = mount(el("div", "entry assistant"));
-      node.innerHTML = renderMarkdown(item.text);
-      decorateCopyables(node);
-    }
+  // Prefer server-paged windows; fall back to a client tail for legacy READY.
+  let slice = entries;
+  if (page && page.offset != null && page.total != null) {
+    state.transcriptOffset = page.offset;
+    state.transcriptTotal = page.total;
+  } else if (entries.length > TRANSCRIPT_REPLAY_LIMIT) {
+    const omitted = entries.length - TRANSCRIPT_REPLAY_LIMIT;
+    slice = entries.slice(-TRANSCRIPT_REPLAY_LIMIT);
+    state.transcriptOffset = omitted;
+    state.transcriptTotal = entries.length;
+  } else {
+    state.transcriptOffset = 0;
+    state.transcriptTotal = entries.length;
   }
-  for (const record of compactions) {
+  let userIndex = 0;
+  for (const item of slice) {
+    userIndex = mountTranscriptEntry(item, userIndex);
+  }
+  for (const record of compactions || []) {
     addCompaction({ summary: record.summary, before: record.before,
                     after: record.after, replaced: record.replaced });
   }
+  renderLoadOlderBar();
   scrollToLatest();
 }
 
 /* ── status ────────────────────────────────────────────────────────── */
 
+function flushPendingTranscript(sessionId) {
+  const pending = state.pendingTranscript;
+  state.pendingTranscript = null;
+  if (!pending) return;
+  if (pending.viewGen !== state.viewGen || pending.session_id !== sessionId) {
+    // Stash was from another generation or a late previous-chat READY.
+    if (state.pinBottomOnReady) send("refresh", { transcript: true });
+    return;
+  }
+  state.pinBottomOnReady = false;
+  replayTranscript(pending.transcript, pending.compactions || [], {
+    offset: pending.transcript_offset,
+    total: pending.transcript_total,
+  });
+  scrollToLatest();
+}
+
+/** Reset composer chrome when the viewed chat changes (don't wait for status). */
+function syncComposerForView(running) {
+  state.busy = !!running;
+  state.promptQueue = [];
+  renderPromptQueue();
+  $("send").disabled = false;
+  $("send").textContent = state.busy ? t("composer.queue") : t("composer.send");
+  $("interrupt").disabled = !state.busy;
+}
+
 function applyStatus(status) {
-  if (!status) return;
-  const prevSession = state.viewSessionId
-    || (state.status && state.status.session_id)
-    || "";
+  if (!status) return false;
   const nextSession = status.session_id || "";
-  const sessionChanged = !!(prevSession && nextSession && prevSession !== nextSession);
-  if (nextSession) state.viewSessionId = nextSession;
+  const viewed = state.viewSessionId || "";
+
+  if (state.viewPending) {
+    // New Chat: bind only from status (READY may still be the previous chat).
+    if (!nextSession) return false;
+    state.viewSessionId = nextSession;
+    state.viewPending = false;
+    flushPendingTranscript(nextSession);
+  } else if (viewed && nextSession && nextSession !== viewed) {
+    // Optimistic click already selected another chat — ignore late status.
+    return false;
+  } else if (nextSession && !viewed) {
+    state.viewSessionId = nextSession;
+  }
+
   state.status = status;
   const wasBusy = state.busy;
   state.busy = status.busy;
-  // Activity dock is global DOM — always retarget it when the viewed chat
-  // changes, otherwise "k3@Kimi 思考中" leaks onto a DeepSeek session.
-  if (sessionChanged) {
-    clearActivity();
-    abandonLiveStreamView();
-    state.pinBottomOnReady = true;
-    if (status.busy) {
-      const line = (status.activity || "").trim()
-        || modelActivityLabel(t("activity.busy"), status.model, status.account);
-      setActivity(line, "busy");
-    }
-  } else if (!status.busy) {
+  if (!status.busy) {
     clearActivity();
   } else if (!state.activities.size) {
     // Switched away and back (or dock was cleared) while still running.
@@ -2121,10 +2338,9 @@ function applyStatus(status) {
     // Do NOT refresh+replay transcript here. push_transcript only has
     // user/assistant text — replaying wipes every live tool card and makes
     // a finished turn look empty. Missed answer text is handled by done().
-  } else if (sessionChanged) {
-    send("refresh", { transcript: true });
   } else if (!wasBusy && status.busy) {
     // Sidebar "运行中" only — do not replay transcript mid-stream.
+    // open_session already pushes transcript; never double-refresh here.
     send("refresh", {});
   }
   applyComposerDraft(status);
@@ -2190,6 +2406,7 @@ function applyStatus(status) {
     state.setupShown = true;
     openPanel("settings");
   }
+  return true;
 }
 
 function syncLanguageSelect(pref) {
@@ -2353,7 +2570,14 @@ function replayPanelTranscript(mode, rows) {
   clearPanelTranscriptDom(mode);
   const host = panelTranscript(mode);
   if (!host || !Array.isArray(rows)) return;
-  for (const row of rows) {
+  let slice = rows;
+  if (rows.length > TRANSCRIPT_REPLAY_LIMIT) {
+    const omitted = rows.length - TRANSCRIPT_REPLAY_LIMIT;
+    slice = rows.slice(-TRANSCRIPT_REPLAY_LIMIT);
+    const note = el("div", "entry notice info", t("session.historyFolded", { n: omitted }));
+    host.appendChild(note);
+  }
+  for (const row of slice) {
     const role = row.role || "assistant";
     const text = row.text || "";
     if (!text) continue;
@@ -2363,8 +2587,66 @@ function replayPanelTranscript(mode, rows) {
   host.scrollTop = host.scrollHeight;
 }
 
+function sessionListStructureKey(msg) {
+  return (msg.workspaces || []).map((group) =>
+    `${group.path}\0${(group.sessions || []).map((s) => s.id).join(",")}`
+  ).join("\n");
+}
+
+function patchSessionList(msg) {
+  const list = $("session-list");
+  if (!list) return false;
+  const metas = new Map();
+  const groupActive = new Map();
+  for (const group of msg.workspaces || []) {
+    groupActive.set(group.path, !!group.active);
+    for (const meta of group.sessions || []) metas.set(meta.id, meta);
+  }
+  const items = [...list.querySelectorAll(".session-item[data-session-id]")];
+  if (items.length !== metas.size) return false;
+  for (const item of items) {
+    const meta = metas.get(item.dataset.sessionId);
+    if (!meta) return false;
+    if ((item.dataset.title || "") !== (meta.title || "")) return false;
+    item.classList.toggle("active", !!meta.active);
+    item.classList.toggle("running", !!meta.running);
+    item.classList.toggle("waiting", !!meta.waiting);
+    item.classList.toggle("archived", !!meta.archived);
+    const title = item.querySelector(".session-title");
+    if (title) {
+      title.querySelectorAll(".session-running, .session-waiting").forEach((n) => n.remove());
+      if (meta.waiting) title.appendChild(el("span", "session-waiting", t("session.waiting")));
+      else if (meta.running) title.appendChild(el("span", "session-running", t("session.running")));
+    }
+    const metaLine = item.querySelector(".session-meta");
+    if (metaLine) metaLine.textContent = `${meta.updated} · ${meta.messages} 条`;
+  }
+  for (const head of list.querySelectorAll(".ws-head[data-ws-path]")) {
+    head.classList.toggle("active", !!groupActive.get(head.dataset.wsPath));
+  }
+  return true;
+}
+
 function renderSessions(msg) {
   const list = $("session-list");
+  const structure = sessionListStructureKey(msg);
+  const canPatch = !!(
+    structure
+    && structure === state.sessionListStructure
+    && list
+    && list.querySelector(".session-item[data-session-id]")
+  );
+  if (canPatch && patchSessionList(msg)) {
+    const toggle = $("archive-toggle");
+    if (toggle) {
+      toggle.textContent = msg.show_archived
+        ? t("nav.hideArchived")
+        : `${t("nav.showArchived")}${msg.archived_count ? ` (${msg.archived_count})` : ""}`;
+      toggle.classList.toggle("hidden", !msg.archived_count && !msg.show_archived);
+    }
+    return;
+  }
+  state.sessionListStructure = structure;
   list.innerHTML = "";
 
   /* Zero projects is a real state, reached by removing the last one. Left
@@ -2384,6 +2666,7 @@ function renderSessions(msg) {
   for (const group of msg.workspaces || []) {
     const block = el("div", "ws-group");
     const head = el("div", `ws-head${group.active ? " active" : ""}`);
+    head.dataset.wsPath = group.path;
     head.append(
       el("span", "ws-caret", state.collapsed.has(group.path) ? "▸" : "▾"),
       el("span", "ws-name", group.name),
@@ -2436,6 +2719,8 @@ function renderSessions(msg) {
 function toggleCollapsed(path) {
   if (state.collapsed.has(path)) state.collapsed.delete(path);
   else state.collapsed.add(path);
+  // Collapse changes the DOM tree — force a full sidebar rebuild.
+  state.sessionListStructure = "";
   if (state.uiMode === "codex" && state.codex.sessions) {
     renderSessions(state.codex.sessions);
   } else if (state.uiMode === "claude" && state.claude.sessions) {
@@ -2445,11 +2730,25 @@ function toggleCollapsed(path) {
   }
 }
 
+function clearAgentTranscriptDom() {
+  const host = transcript();
+  if (!host) return;
+  host.innerHTML = "";
+  host.scrollTop = 0;
+  state.tools.clear();
+  state.resources.clear();
+  state.lastUserEntry = null;
+  renderResourceStrip();
+  clearInlineHitl();
+}
+
 function sessionRow(meta, group) {
   const running = !!meta.running;
   const waiting = !!meta.waiting;
   const item = el("div",
     `session-item${meta.active ? " active" : ""}${meta.archived ? " archived" : ""}${running ? " running" : ""}${waiting ? " waiting" : ""}`);
+  item.dataset.sessionId = meta.id || "";
+  item.dataset.title = meta.title || "";
   const prefix = panelSessionPrefix();
 
   const actions = el("span", "session-actions");
@@ -2482,6 +2781,7 @@ function sessionRow(meta, group) {
     if (prefix === "codex") {
       if (id && id !== state.viewCodexSessionId) {
         state.viewCodexSessionId = id;
+        state.viewCodexPending = false;
         clearPanelTranscriptDom("codex");
         clearPanelActivity("codex");
       }
@@ -2494,6 +2794,7 @@ function sessionRow(meta, group) {
     if (prefix === "claude") {
       if (id && id !== state.viewClaudeSessionId) {
         state.viewClaudeSessionId = id;
+        state.viewClaudePending = false;
         clearPanelTranscriptDom("claude");
         clearPanelActivity("claude");
       }
@@ -2506,9 +2807,16 @@ function sessionRow(meta, group) {
       // Retarget stream filter + sticky dock immediately — do not wait for
       // status, or the previous chat's "思考中" keeps blinking on this one.
       state.viewSessionId = id;
+      state.viewGen += 1;
+      state.viewPending = false;
+      state.pendingTranscript = null;
       clearActivity();
       abandonLiveStreamView();
       state.pinBottomOnReady = true;
+      clearAgentTranscriptDom();
+      mount(el("div", "entry notice info", t("session.loading")));
+      // Don't keep Interrupt/queue chrome from the chat we just left.
+      syncComposerForView(!!meta.running);
       if (meta.running) {
         setActivity(t("session.running") + "…", "busy");
       }
@@ -4086,6 +4394,9 @@ function flushPromptQueue() {
 }
 
 function dispatchPrompt(text, images, refs, shown) {
+  // Seal any leftover stream node before the new user row, or deltas for
+  // this turn would keep concatenating into the previous answer bubble.
+  finishStreaming();
   const display = shown != null ? shown : (refs.length
     ? `${refs.map((r) => `@${r}`).join(" ")}${text ? `\n${text}` : ""}`
     : text);
@@ -4128,6 +4439,8 @@ function requestContinueWork() {
     toast(t("toast.busy"), "warn");
     return;
   }
+  finishStreaming();
+  state.turnHadText = false;
   if (!send("continue_work", {})) {
     setConnBanner("error", t("conn.retrying"));
     toast(t("conn.offlineSend"), "warn");
@@ -4365,10 +4678,31 @@ function renderCodexEffortSelect() {
 function applyCodexStatus(msg) {
   if (!msg) return;
   const prevView = state.viewCodexSessionId;
-  state.codex = { ...state.codex, ...msg };
-  if (state.codex.viewed_id || state.codex.panel_session_id) {
-    state.viewCodexSessionId = state.codex.viewed_id || state.codex.panel_session_id;
+  const incomingView = msg.viewed_id || msg.panel_session_id || "";
+  const wasBusy = !!(state.codex && state.codex.busy);
+  if (state.viewCodexPending) {
+    if (!incomingView) {
+      if (msg.sessions && state.uiMode === "codex") {
+        state.codex = { ...state.codex, sessions: msg.sessions };
+        renderSessions(msg.sessions);
+      }
+      return;
+    }
+    state.viewCodexSessionId = incomingView;
+    state.viewCodexPending = false;
+  } else if (prevView && incomingView && incomingView !== prevView) {
+    // Stale status for a chat we already left — keep optimistic view.
+    if (msg.sessions && state.uiMode === "codex") {
+      state.codex = { ...state.codex, sessions: msg.sessions };
+      renderSessions(msg.sessions);
+    }
+    return;
   }
+  state.codex = { ...state.codex, ...msg };
+  if (incomingView && (!state.viewCodexSessionId || incomingView === state.viewCodexSessionId)) {
+    state.viewCodexSessionId = incomingView;
+  }
+  if (wasBusy && !state.codex.busy) clearPanelActivity("codex");
   const label = t(`codex.state.${state.codex.state || "stopped"}`) || state.codex.state || "—";
   const statusText = $("codex-status-text");
   if (statusText) {
@@ -4416,6 +4750,7 @@ function applyCodexStatus(msg) {
   if (
     Array.isArray(msg.transcript)
     && nextView
+    && (!incomingView || incomingView === nextView)
     && (
       nextView !== prevView
       || state.codexReplayPending
@@ -4482,10 +4817,29 @@ function renderClaudeEffortSelect() {
 function applyClaudeStatus(msg) {
   if (!msg) return;
   const prevView = state.viewClaudeSessionId;
+  const incomingView = msg.viewed_id || msg.panel_session_id || "";
   const wasBusy = !!(state.claude && state.claude.busy);
+  if (state.viewClaudePending) {
+    if (!incomingView) {
+      if (msg.sessions && state.uiMode === "claude") {
+        state.claude = { ...state.claude, sessions: msg.sessions };
+        renderSessions(msg.sessions);
+      }
+      return;
+    }
+    state.viewClaudeSessionId = incomingView;
+    state.viewClaudePending = false;
+  } else if (prevView && incomingView && incomingView !== prevView) {
+    // Stale status for a chat we already left — keep optimistic view.
+    if (msg.sessions && state.uiMode === "claude") {
+      state.claude = { ...state.claude, sessions: msg.sessions };
+      renderSessions(msg.sessions);
+    }
+    return;
+  }
   state.claude = { ...state.claude, ...msg };
-  if (state.claude.viewed_id || state.claude.panel_session_id) {
-    state.viewClaudeSessionId = state.claude.viewed_id || state.claude.panel_session_id;
+  if (incomingView && (!state.viewClaudeSessionId || incomingView === state.viewClaudeSessionId)) {
+    state.viewClaudeSessionId = incomingView;
   }
   // Drop a stuck "系统: status" pulse when the runtime reports idle.
   if (wasBusy && !state.claude.busy) clearPanelActivity("claude");
@@ -4545,6 +4899,7 @@ function applyClaudeStatus(msg) {
   if (
     Array.isArray(msg.transcript)
     && nextView
+    && (!incomingView || incomingView === nextView)
     && (
       nextView !== prevView
       || state.claudeReplayPending
@@ -4926,9 +5281,12 @@ function addCodexEntry(kind, text) {
 
 function appendCodexText(delta) {
   if (!delta) return;
-  state.codexBuffer = (state.codexBuffer || "") + delta;
   const host = codexTranscript();
   if (!host) return;
+  if (state.codexStreaming && !streamNodeAfterLastUser(host, state.codexStreaming)) {
+    finishCodexStream();
+  }
+  state.codexBuffer = (state.codexBuffer || "") + delta;
   if (!state.codexStreaming || !host.contains(state.codexStreaming)) {
     const node = el("div", "entry assistant");
     node.textContent = state.codexBuffer;
@@ -4965,6 +5323,7 @@ function submitCodexPrompt() {
   const text = (box.value || "").trim();
   const images = panelImagesPayload("codex");
   if (!text && !images.length) return;
+  finishCodexStream();
   addCodexEntry("user", text || `(${images.length} image)`);
   box.value = "";
   box.style.height = `${COMPOSER_MIN_HEIGHT_PX}px`;
@@ -5020,9 +5379,12 @@ function addClaudeEntry(kind, text) {
 
 function appendClaudeText(delta) {
   if (!delta) return;
-  state.claudeBuffer = (state.claudeBuffer || "") + delta;
   const host = claudeTranscript();
   if (!host) return;
+  if (state.claudeStreaming && !streamNodeAfterLastUser(host, state.claudeStreaming)) {
+    finishClaudeStream();
+  }
+  state.claudeBuffer = (state.claudeBuffer || "") + delta;
   if (!state.claudeStreaming || !host.contains(state.claudeStreaming)) {
     const node = el("div", "entry assistant");
     node.textContent = state.claudeBuffer;
@@ -5059,6 +5421,7 @@ function submitClaudePrompt() {
   const text = (box.value || "").trim();
   const images = panelImagesPayload("claude");
   if (!text && !images.length) return;
+  finishClaudeStream();
   addClaudeEntry("user", text || `(${images.length} image)`);
   box.value = "";
   box.style.height = `${COMPOSER_MIN_HEIGHT_PX}px`;
@@ -5439,21 +5802,33 @@ function wire() {
     const prefix = panelSessionPrefix();
     if (prefix === "codex") {
       state.viewCodexSessionId = "";
+      state.viewCodexPending = true;
       state.codexReplayPending = true;
       clearPanelTranscriptDom("codex");
+      clearPanelActivity("codex");
       send("codex_new_session", {});
       return;
     }
     if (prefix === "claude") {
       state.viewClaudeSessionId = "";
+      state.viewClaudePending = true;
       state.claudeReplayPending = true;
       clearPanelTranscriptDom("claude");
+      clearPanelActivity("claude");
       send("claude_new_session", {});
       return;
     }
     flushDraftNow();
+    // Pending bind — do not keep the previous id (filter fallback) or "".
+    state.viewSessionId = "";
+    state.viewGen += 1;
+    state.viewPending = true;
+    state.pendingTranscript = null;
     abandonLiveStreamView();
     state.pinBottomOnReady = true;
+    clearAgentTranscriptDom();
+    mount(el("div", "entry notice info", t("session.loading")));
+    syncComposerForView(false);
     send("new_session", {});
   };
   $("goal-cancel").onclick = () => send("stop_heartbeat", {});

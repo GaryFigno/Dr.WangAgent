@@ -111,13 +111,71 @@ def test_the_frontend_escapes_model_output():
     assert render.index("escapeHtml") < render.index("<pre>")
 
 
+def _js_function(source: str, name: str) -> str:
+    start = source.index(f"function {name}")
+    depth = 0
+    for index in range(source.index("{", start), len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    raise AssertionError(f"unclosed function {name}")
+
+
 def test_streaming_text_is_not_parsed_as_markup_per_delta():
     """Per-delta markdown parsing is what makes a chat UI feel heavy."""
     source = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
-    append = source[source.index("function appendText") :]
-    append = append[: append.index("\n}")]
+    append = _js_function(source, "appendText")
     assert "textContent" in append
     assert "innerHTML" not in append
+    assert "streamNodeAfterLastUser" in append
+
+
+def test_ready_and_status_are_session_scoped_in_the_frontend():
+    """Untagged READY/status after a fast session switch painted the wrong chat."""
+    source = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    scoped = source[source.index("const SESSION_SCOPED") :]
+    scoped = scoped[: scoped.index("];") + 2]
+    assert '"ready"' in scoped or "'ready'" in scoped
+    assert "function streamNodeAfterLastUser" in source
+    ensure = _js_function(source, "ensureAssistantVisible")
+    assert "if (state.turnHadText) return" in ensure
+    assert "never overwrite" in ensure.lower() or "non-empty" in ensure
+    dispatch = _js_function(source, "dispatchPrompt")
+    assert "finishStreaming()" in dispatch
+    assert dispatch.index("finishStreaming()") < dispatch.index("addUser(")
+    apply = _js_function(source, "applyStatus")
+    assert "return false" in apply
+    assert "return true" in apply
+    assert "viewPending" in apply
+    assert "flushPendingTranscript" in apply
+    assert "sessionChanged" not in apply
+    # Stale status must not still paint turn_refs.
+    status_handler = source[source.index("status(msg)") :]
+    status_handler = status_handler[: status_handler.index("context(msg)")]
+    assert "if (!applyStatus(msg.status)) return" in status_handler
+    active = _js_function(source, "forActiveSession")
+    assert "viewPending" in active
+    # Must not fall back to the previous chat's status id while switching.
+    assert "state.status && state.status.session_id" not in active
+    assert "clearAgentTranscriptDom" in source
+    assert "syncComposerForView" in source
+    assert "TRANSCRIPT_REPLAY_LIMIT" in source
+    assert "viewCodexPending" in source
+    assert "viewClaudePending" in source
+
+
+async def test_push_transcript_tags_ready_with_session_id(gui, sent):
+    """Frontend drops READY whose session_id ≠ optimistic viewSessionId."""
+    sent.clear()
+    await gui.push_transcript()
+    ready = next(item for item in reversed(sent) if item.get("type") == "ready")
+    assert ready.get("session_id") == gui.session.meta.id
+    assert isinstance(ready.get("transcript"), list)
+    await gui.close()
 
 
 # -- the server ------------------------------------------------------------
@@ -1738,9 +1796,92 @@ async def test_turn_events_carry_session_id(gui, sent, fake):
     await gui_commands.run_turn(gui, "say hi")
     start = last(sent, "turn_start")
     assert start["session_id"] == gui.session.meta.id
+    assert start.get("turn_id")
     texts = [m for m in sent if m["type"] == "text"]
     assert texts and all(m.get("session_id") == gui.session.meta.id for m in texts)
+    assert all(m.get("turn_id") == start["turn_id"] for m in texts)
+    done = last(sent, "done")
+    assert done.get("turn_id") == start["turn_id"]
     await gui.close()
+
+
+async def test_background_stream_deltas_are_suppressed(gui, sent, monkeypatch):
+    """While viewing another chat, TEXT/ACTIVITY for the live turn stay off-wire."""
+    from aiharness.agent.loop import Done, Text
+
+    async def slow_run(_self, _text):
+        yield Text("chunk-one")
+        await asyncio.sleep(0.2)
+        yield Text("chunk-two")
+        yield Done(text="chunk-onechunk-two")
+
+    monkeypatch.setattr(type(gui.agent), "run", slow_run)
+    first_id = gui.session.meta.id
+    task = asyncio.create_task(gui_commands.run_turn(gui, "long turn"))
+    for _ in range(100):
+        if first_id in gui.live:
+            break
+        await asyncio.sleep(0.01)
+    assert first_id in gui.live
+    # Let the first TEXT land while still viewing this chat.
+    await asyncio.sleep(0.05)
+
+    await gui_commands.dispatch(gui, Inbound.NEW_SESSION, {})
+    second_id = gui.session.meta.id
+    assert second_id != first_id
+    sent.clear()
+    await task
+
+    # Stream chrome for the background turn must not spam the open pane.
+    assert not any(
+        m.get("type") in {"text", "thinking", "activity", "tool_start", "done"}
+        and m.get("session_id") == first_id
+        for m in sent
+    )
+    # Sidebar / status updates still flow.
+    assert any(m.get("type") == "sessions" for m in sent)
+    await gui.close()
+
+
+async def test_push_transcript_pages_and_load_older(gui, sent):
+    """Long chats open on a tail page; load_transcript prepends earlier rows."""
+    from aiharness.providers.base import Message
+
+    # Build more than one page of visible turns.
+    for index in range(100):
+        gui.agent._append(
+            Message(role="user", content=f"u{index}", meta={"user_text": f"u{index}"})
+        )
+        gui.agent._append(Message(role="assistant", content=f"a{index}"))
+    sent.clear()
+    await gui.push_transcript()
+    ready = next(item for item in reversed(sent) if item.get("type") == "ready")
+    assert ready.get("replace") is True
+    assert ready["transcript_total"] == 200
+    assert ready["transcript_offset"] == 200 - gui.TRANSCRIPT_PAGE
+    assert len(ready["transcript"]) == gui.TRANSCRIPT_PAGE
+    assert ready["transcript"][0]["id"]
+    assert ready["transcript"][0]["role"] in {"user", "assistant"}
+
+    before = ready["transcript_offset"]
+    sent.clear()
+    await gui_commands.dispatch(
+        gui, Inbound.LOAD_TRANSCRIPT, {"before": before, "limit": 40}
+    )
+    older = next(item for item in reversed(sent) if item.get("type") == "ready")
+    assert older.get("replace") is False
+    assert older["transcript_offset"] == before - 40
+    assert len(older["transcript"]) == 40
+    await gui.close()
+
+
+def test_frontend_binds_streams_by_turn_id_and_loads_older():
+    source = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    append = _js_function(source, "appendText")
+    assert "dataset.turnId" in append
+    assert "function prependTranscript" in source
+    assert "load_transcript" in source
+    assert "loadOlder" in source
 
 
 async def test_run_turn_hard_cancel_emits_terminal_done(gui, sent, monkeypatch):

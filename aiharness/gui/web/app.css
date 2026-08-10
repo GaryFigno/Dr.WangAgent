@@ -598,6 +598,16 @@ button, input, select, textarea { font-family: inherit; font-size: inherit; }
 .entry.notice { font-size: 12px; color: var(--text-dim); }
 .entry.notice.warn { color: var(--warn); }
 .entry.notice.error { color: var(--error); }
+.entry.load-older { text-align: center; }
+.entry.load-older .linkish {
+  background: none;
+  border: none;
+  color: var(--accent, #6aa9ff);
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+  padding: 0;
+}
 
 /* tool calls */
 .tool {

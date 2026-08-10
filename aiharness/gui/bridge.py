@@ -57,12 +57,34 @@ class LiveTurn:
     handle: SessionHandle
     agent: Agent
     task: asyncio.Task | None = None
+    #: Stable id for this turn's stream bubbles on the wire.
+    turn_id: str = ""
     #: Last activity line for this turn (restored when the user switches back).
     last_activity: str = ""
     #: Second interrupt (or shutdown) escalates to ``task.cancel()``.
     hard_cancel: bool = False
     #: True once ``Outbound.DONE`` was pushed for this turn (cancel-safe).
     done_sent: bool = False
+
+
+#: Stream chrome that must not paint onto a chat the user is not viewing.
+#: HITL (ask/permission/plan) and list/status updates still go through.
+_VIEW_SCOPED_STREAM = frozenset(
+    {
+        Outbound.TEXT,
+        Outbound.THINKING,
+        Outbound.ACTIVITY,
+        Outbound.TOOL_START,
+        Outbound.TOOL_END,
+        Outbound.TURN_START,
+        Outbound.TURN_END,
+        Outbound.COMPACTED,
+        Outbound.DONE,
+        Outbound.NOTICE,
+        Outbound.CANVAS_HINT,
+        Outbound.EDIT_REVIEW,
+    }
+)
 
 
 @dataclass
@@ -463,6 +485,16 @@ class GuiSession:
             text = str(payload.get("text") or "").strip()
             if text:
                 self.note_activity(sid, text)
+        # Drop stream chrome for background turns — the client used to parse
+        # every delta then throw it away (main-thread cost on long tools).
+        viewed = self.session.meta.id if self.session is not None else ""
+        if (
+            outbound in _VIEW_SCOPED_STREAM
+            and sid
+            and viewed
+            and sid != viewed
+        ):
+            return
         try:
             await self._send(message(outbound, **payload))
         except Exception:  # noqa: BLE001 — never kill a turn because the UI left
@@ -927,16 +959,20 @@ class GuiSession:
             },
         ]
 
-    async def push_transcript(self) -> None:
-        """Replay the open session so a reconnect shows the conversation."""
+    #: Page size for initial replay and "load older" chunks.
+    TRANSCRIPT_PAGE = 80
+
+    def build_transcript_entries(self) -> list[dict[str, Any]]:
+        """Serialize the open session's visible user/assistant turns."""
         from ..providers.base import message_text
         from ..session.attachments import refs_from_meta
 
         entries: list[dict[str, Any]] = []
         session_id = self.session.meta.id
-        for msg in self.agent.messages:
+        for index, msg in enumerate(self.agent.messages):
             if msg.meta.get("compacted"):
                 continue
+            msg_id = str(msg.meta.get("id") or f"{session_id}:{index}")
             if msg.role == "user":
                 text = msg.meta.get("user_text") or message_text(msg.content)
                 images = [
@@ -948,21 +984,68 @@ class GuiSession:
                     for ref in refs_from_meta(msg.meta)
                     if ref.get("file")
                 ]
-                entries.append({"role": "user", "text": text, "images": images})
+                entries.append(
+                    {
+                        "id": msg_id,
+                        "role": "user",
+                        "text": text,
+                        "images": images,
+                    }
+                )
             elif msg.role == "assistant" and msg.content:
                 entries.append(
-                    {"role": "assistant", "text": message_text(msg.content)}
+                    {
+                        "id": msg_id,
+                        "role": "assistant",
+                        "text": message_text(msg.content),
+                    }
                 )
-        markers = [
-            {
-                "summary": record.summary,
-                "before": record.tokens_before,
-                "after": record.tokens_after,
-                "replaced": record.replaced_through,
-            }
-            for record in self.session.compactions
-        ]
-        await self.push(Outbound.READY, transcript=entries, compactions=markers)
+        return entries
+
+    async def push_transcript(
+        self,
+        *,
+        before: int | None = None,
+        limit: int | None = None,
+        replace: bool = True,
+    ) -> None:
+        """Replay (or prepend) transcript pages for the open session.
+
+        Args:
+          before: Exclusive end index into the full entry list. ``None`` means
+            the end (tail page). Used by "load older".
+          limit: Max entries in this chunk (default :attr:`TRANSCRIPT_PAGE`).
+          replace: When true, the client replaces the pane; when false, it
+            prepends older rows above the fold.
+        """
+        session_id = self.session.meta.id
+        entries = self.build_transcript_entries()
+        total = len(entries)
+        page = limit if limit is not None else self.TRANSCRIPT_PAGE
+        page = max(1, min(int(page), 500))
+        end = total if before is None else max(0, min(int(before), total))
+        start = max(0, end - page)
+        chunk = entries[start:end]
+        markers: list[dict[str, Any]] = []
+        if replace:
+            markers = [
+                {
+                    "summary": record.summary,
+                    "before": record.tokens_before,
+                    "after": record.tokens_after,
+                    "replaced": record.replaced_through,
+                }
+                for record in self.session.compactions
+            ]
+        await self.push(
+            Outbound.READY,
+            transcript=chunk,
+            compactions=markers,
+            session_id=session_id,
+            transcript_offset=start,
+            transcript_total=total,
+            replace=replace,
+        )
 
     async def push_all(self) -> None:
         await self.push_status()

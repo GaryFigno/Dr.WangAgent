@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -208,14 +209,17 @@ async def run_turn(
     selection = agent.selection
     turn_refs = list(refs if refs is not None else session.last_turn_refs)
     # Pin ownership to this conversation. The user may open another chat
-    # mid-turn; events keep flowing tagged with this id and the frontend
-    # ignores them while looking elsewhere.
+    # mid-turn; events keep flowing tagged with this id. Backend drops
+    # view-scoped stream chrome while another chat is open; the frontend
+    # also filters by session_id / turn_id as a second line of defence.
     turn_session_id = handle.meta.id
+    turn_id = uuid.uuid4().hex[:16]
     live = LiveTurn(
         session_id=turn_session_id,
         handle=handle,
         agent=agent,
         task=asyncio.current_task(),
+        turn_id=turn_id,
     )
     session.live[turn_session_id] = live
     session.stream_session_id = turn_session_id
@@ -237,6 +241,7 @@ async def run_turn(
             images=_transcript_images(session, images),
             refs=turn_refs,
             session_id=turn_session_id,
+            turn_id=turn_id,
         )
         if notice:
             await session.push(
@@ -284,7 +289,12 @@ async def run_turn(
             )
 
         async for event in agent.run(None):
-            final = await _forward(session, event, session_id=turn_session_id) or final
+            final = (
+                await _forward(
+                    session, event, session_id=turn_session_id, turn_id=turn_id
+                )
+                or final
+            )
     except asyncio.CancelledError:
         # Hard cancel can land between an assistant tool_calls message and
         # its tool results; seal before the next prompt hits the provider.
@@ -298,12 +308,14 @@ async def run_turn(
                 level="warn",
                 text=session.msg("interrupted"),
                 session_id=turn_session_id,
+                turn_id=turn_id,
             )
             await session.push(
                 Outbound.DONE,
                 text=final,
                 interrupted=True,
                 session_id=turn_session_id,
+                turn_id=turn_id,
             )
         raise
     except Exception as error:  # noqa: BLE001 — surface instead of silent idle
@@ -315,12 +327,14 @@ async def run_turn(
                 level="error",
                 text=f"{type(error).__name__}: {error}",
                 session_id=turn_session_id,
+                turn_id=turn_id,
             )
             await session.push(
                 Outbound.DONE,
                 text=final,
                 interrupted=False,
                 session_id=turn_session_id,
+                turn_id=turn_id,
             )
     finally:
         agent.seal_unanswered_tool_calls()
@@ -428,12 +442,19 @@ async def _drain_router_notices(
 
 
 async def _forward(
-    session: GuiSession, event: Any, *, session_id: str = ""
+    session: GuiSession,
+    event: Any,
+    *,
+    session_id: str = "",
+    turn_id: str = "",
 ) -> str | None:
     """Translate one agent event into a frontend message."""
     sid = session_id or session.session.meta.id
+    tid = turn_id or (session.live.get(sid).turn_id if session.live.get(sid) else "")
 
     async def _push(outbound: Outbound, **payload: Any) -> None:
+        if tid:
+            payload.setdefault("turn_id", tid)
         await session.push(outbound, session_id=sid, **payload)
 
     if isinstance(event, Text):
@@ -1491,6 +1512,23 @@ async def _refresh(session: GuiSession, args: dict[str, Any]) -> None:
     await session.push_context()
     await session.push_workspace(RecentWorkspaces.load().existing())
     await session.push_skills()
+
+
+async def _load_transcript(session: GuiSession, args: dict[str, Any]) -> None:
+    """Prepend an older page of the open session's transcript."""
+    before = args.get("before")
+    limit = args.get("limit")
+    try:
+        before_i = int(before) if before is not None else None
+    except (TypeError, ValueError):
+        before_i = None
+    try:
+        limit_i = int(limit) if limit is not None else None
+    except (TypeError, ValueError):
+        limit_i = None
+    if before_i is None or before_i <= 0:
+        return
+    await session.push_transcript(before=before_i, limit=limit_i, replace=False)
 
 
 # --------------------------------------------------------------------------
@@ -2945,6 +2983,7 @@ HANDLERS: dict[Inbound, Any] = {
     Inbound.SET_ACCOUNT_PROXY: _set_account_proxy,
     Inbound.SAVE_CONFIG: _save_config,
     Inbound.REFRESH: _refresh,
+    Inbound.LOAD_TRANSCRIPT: _load_transcript,
     Inbound.START_HEARTBEAT: _start_heartbeat,
     Inbound.STOP_HEARTBEAT: _stop_heartbeat,
     Inbound.EDIT_DECISION: _edit_decision,

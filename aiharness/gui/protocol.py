@@ -145,6 +145,7 @@ class Inbound(str, Enum):
     SET_ACCOUNT_PROXY = "set_account_proxy"
     SAVE_CONFIG = "save_config"
     REFRESH = "refresh"  # resend status, sessions and config
+    LOAD_TRANSCRIPT = "load_transcript"  # older page for the open session
     COMPACT = "compact"
     UNCOMPACT = "uncompact"
     START_HEARTBEAT = "start_heartbeat"
