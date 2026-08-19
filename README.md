@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/Platform-Windows-important.svg)]()
-[![License](https://img.shields.io/badge/License-PolyForm_Noncommercial_1.0.0-important.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-informational.svg)](LICENSE)
 
 [English](README.en.md) · 简体中文
 
@@ -29,6 +29,13 @@ Windows 本地桌面编码 Agent。支持任意 OpenAI 兼容 API，并内置 **
 - 面板内换 API（供应商模板 + `base_url` / key）
 - MCP、Skill、定时任务、桌面控制 / 内置浏览器（可选）
 - 桌面窗口（WebView2）+ 终端 TUI
+
+## 内置游戏工作室工具包
+
+除编码 Agent 外，本仓库附带我们运营「一名创始人 + 多 AI 员工」游戏工作室的工具：
+
+- `skills/worldclaw-openworld/` —— 文本生成 3D 开放世界的 Agent 蓝图（对腾讯混元 WorldClaw 的方法论复现）：语义布局 → 可复用 Hunyuan3D / Tripo3D 资产 → 地形 → 位姿恢复 → 租约保护的 Blender MCP 装配。
+- [`docs/AI_STUDIO_PLAYBOOK.en.md`](docs/AI_STUDIO_PLAYBOOK.en.md) —— 多 AI 游戏生产运营手册：四角色（前台 / 制作 / 异模型验收 / 集成）、一句话信箱派单、分阶段验收、一人一 worktree 的 Git 纪律与门禁纪律。从一次真实的 23 天失败旗舰会话（244 次压缩、约 2.7 万次工具调用、交付 0 张地图）中提炼，重构为能交付的生产线。
 
 ## 三个面板
 
@@ -83,12 +90,11 @@ python packaging/build.py --clean --installer
 
 ## 许可证与商标
 
-**PolyForm Noncommercial License 1.0.0**（见 `LICENSE`）：
+**MIT 许可证**（见 `LICENSE`）：
 
-- 允许个人 / 学习 / 研究 / 内部试用等非商业使用、修改与分发
-- 不允许商业用途；商业授权请通过仓库 Issue 联系
+- 个人 / 研究 / 内部 / 商业使用、修改与分发均可
 
-「Dr.Wang」「Dr.Wang Agent」与招财猫 logo 为商标，不在许可证授权范围内。派生作品须改名并更换标识。详见 [`NOTICE`](NOTICE)。
+「Dr.Wang」「Dr.Wang Agent」与招财猫 logo 为作者保留商标。派生作品须改名并更换标识。详见 [`NOTICE`](NOTICE)。
 
 ## 安全
 

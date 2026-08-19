@@ -7,13 +7,13 @@ Welcome! Before you start, please read this page. This project is
 
 ## 许可证说明 / License notice
 
-本仓库采用 **PolyForm Noncommercial License 1.0.0**（见 `LICENSE`）。
+本仓库采用 **MIT 许可证**（见 `LICENSE`）。
 
 **你提交的代码默认按仓库许可证授权。** 这意味着你的贡献只能用于非商业用途；
 如需商业授权，需要作者另行安排。不接受这一点请不要提交。
 
 By submitting a PR you agree that your contribution is licensed under the
-repository license (PolyForm Noncommercial 1.0.0). Contributions are therefore
+repository license (MIT). Contributions are therefore
 noncommercial-only; a commercial license requires separate arrangements with
 the author. Please do not submit if you do not agree.
 

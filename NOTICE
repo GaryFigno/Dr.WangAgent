@@ -3,8 +3,8 @@
 "Dr.Wang", "Dr.Wang Agent", and the zhaocai (招财) cat logo are **trademarks
 of the licensor** ("the Trademarks").
 
-The PolyForm Noncommercial License 1.0.0 (`LICENSE`) grants you rights to use,
-copy, modify and distribute the software, but it **does not** grant you any
+The MIT License (`LICENSE`) grants you rights to use,
+copy, modify and distribute the software, including commercially, but it **does not** grant you any
 rights to the Trademarks. In particular, unless you have prior written
 permission from the licensor, you may not:
 
@@ -25,7 +25,7 @@ purposes is fine and does not require permission.
 
 「Dr.Wang」「Dr.Wang Agent」以及招财猫 logo 是**许可方的商标**（下称"商标"）。
 
-PolyForm Noncommercial License 1.0.0（见 `LICENSE`）授权你使用、复制、修改和
+MIT 许可证（见 `LICENSE`）授权你使用、复制、修改和
 分发本软件，但**不**授予你任何使用商标的权利。未经许可方事先书面同意，你尤其
 不得：
 

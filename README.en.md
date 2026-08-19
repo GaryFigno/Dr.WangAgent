@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/Platform-Windows-important.svg)]()
-[![License](https://img.shields.io/badge/License-PolyForm_Noncommercial_1.0.0-important.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-informational.svg)](LICENSE)
 
 English · [简体中文](README.md)
 
@@ -29,6 +29,13 @@ Models and API accounts are decoupled: one model can sit on several accounts / g
 - In-panel API switching (vendor templates + `base_url` / key)
 - MCP, Skills, scheduled jobs, optional desktop control / browser
 - Desktop window (WebView2) + terminal TUI
+
+## Bundled game-studio toolkit
+
+Beyond a coding agent, this repo ships the tooling we use to run a one-founder + multi-AI game studio:
+
+- `skills/worldclaw-openworld/` — an agentic blueprint for text-to-3D-open-world generation (our methodology reproduction of Tencent Hunyuan's WorldClaw): semantic layout → reusable Hunyuan3D / Tripo3D assets → terrain → placement recovery → lease-protected Blender MCP assembly.
+- [`docs/AI_STUDIO_PLAYBOOK.en.md`](docs/AI_STUDIO_PLAYBOOK.en.md) — the operating manual for multi-AI game production: four roles (front desk / builder / cross-model reviewer / integrator), one-sentence mailbox dispatch, staged acceptance, one-worker-one-worktree git discipline, and gate hygiene. Distilled from a real 23-day failed flagship session (244 compactions, ~27k tool calls, 0 maps delivered) and rebuilt into a production line that ships.
 
 ## Three panels
 
@@ -83,12 +90,11 @@ python packaging/build.py --clean --installer
 
 ## License & trademarks
 
-**PolyForm Noncommercial License 1.0.0** (`LICENSE`):
+**MIT License** (`LICENSE`):
 
-- Allowed: personal / learning / research / internal noncommercial use, modification, and distribution
-- Not allowed: commercial use; contact via GitHub Issues for commercial licensing
+- Free for personal, research, internal, and commercial use, modification, and distribution
 
-“Dr.Wang”, “Dr.Wang Agent”, and the zhaocai cat logo are trademarks and are **not** licensed under PolyForm. Derivatives must use a different name and visual identity. See [`NOTICE`](NOTICE).
+“Dr.Wang”, “Dr.Wang Agent”, and the zhaocai cat logo are trademarks reserved by the author. Derivatives must use a different name and visual identity. See [`NOTICE`](NOTICE).
 
 ## Security
 
